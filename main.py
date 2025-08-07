@@ -1,45 +1,35 @@
-import pandas as pd
-import time
+import yfinance as yf
 from datetime import datetime
-from core.fetch_data import get_price_data
-from core.signals import generate_trade_ideas
-from core.strategy import find_trade_opportunity
-from core.filter_options import get_best_option
-from notification.email_alerts import send_email_alert
+from core.signals import generate_signals
+from core.utils import send_email, log
 
-def run_bot():
+TICKERS = [
+    "SPY", "AAPL", "TSLA", "MSFT", "AMZN", "GOOGL",
+    "NVDA", "META", "NFLX", "AMD", "AAL", "PLTR",
+    "F", "RIVN", "SOFI"
+]
+
+log("🔁 Running Option Pro bot...")
+
+trade_ideas = []
+
+for ticker in TICKERS:
     try:
-        with open("data/symbols.txt", "r") as file:
-            tickers = [line.strip() for line in file if line.strip()]
-    except FileNotFoundError:
-        print("❌ symbols.txt not found. Please add some tickers in /data/symbols.txt")
-        return
+        data = yf.download(ticker, period="7d", interval="15m")
+        signal = generate_signals(data)
+        if signal:
+            trade_ideas.append(f"[{ticker}] {signal}")
+    except Exception as e:
+        log(f"[{ticker}] ⚠️ Error: {e}")
 
-    trade_ideas = []
-
-    for ticker in tickers:
-        try:
-            df = get_price_data(ticker)
-            signals = generate_trade_ideas(df)
-
-            if signal:
-                trade = find_trade_opportunity(ticker, signal, df)
-                option = get_best_option(ticker, trade)
-                if option:
-                    trade_ideas.append(option)
-        except Exception as e:
-            print(f"[{ticker}] ⚠️ Error: {e}")
-
-    if trade_ideas:
-        df = pd.DataFrame(trade_ideas)
-        df.to_csv("output/trade_ideas.csv", index=False)
-
-        print(f"📧 Found {len(trade_ideas)} trades. Preparing email...")
-        send_email_alert(trade_ideas)
-        print("✅ Email function completed.")
-    else:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ No trade ideas this hour.")
-
-if __name__ == "__main__":
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔁 Running Option Pro bot...")
-    run_bot()
+if not trade_ideas:
+    log("⚠️ No trade ideas this hour.")
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    send_email(
+        subject=f"Option Pro - No Trade Ideas [{timestamp}]",
+        body="The bot ran successfully, but found no trade opportunities this hour."
+    )
+else:
+    message = "📊 Trade Ideas:\n\n" + "\n".join(trade_ideas)
+    send_email("Option Pro - Trade Signals", message)
+    log("✅ Email with trade ideas sent.")
