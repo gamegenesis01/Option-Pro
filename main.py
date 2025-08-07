@@ -30,15 +30,16 @@ def run_bot():
         except Exception as e:
             print(f"[{ticker}] ⚠️ Error: {e}")
 
-   if trade_ideas:
-    df = pd.DataFrame(trade_ideas)
-    df.to_csv("output/trade_ideas.csv", index=False)
+       if trade_ideas:
+        df = pd.DataFrame(trade_ideas)
+        df.to_csv("output/trade_ideas.csv", index=False)
 
-    print(f"📧 Found {len(trade_ideas)} trades. Preparing email...")
-    send_email_alert(trade_ideas)
-    print("✅ Email function completed.")
-else:
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ No trade ideas this hour.")
+        print(f"📧 Found {len(trade_ideas)} trades. Preparing email...")
+        send_email_alert(trade_ideas)
+        print("✅ Email function completed.")
+    else:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ No trade ideas this hour.")
+
 
 
 if __name__ == "__main__":
