@@ -41,7 +41,5 @@ def run_bot():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ No trade ideas this hour.")
 
 if __name__ == "__main__":
-    while True:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔁 Running Option Pro bot...")
-        run_bot()
-        time.sleep(3600)  # Wait one hour
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔁 Running Option Pro bot...")
+    run_bot()
