@@ -20,7 +20,7 @@ def run_bot():
     for ticker in tickers:
         try:
             df = get_price_data(ticker)
-            signal = generate_signals(df)
+            signals = generate_trade_ideas(df)
 
             if signal:
                 trade = find_trade_opportunity(ticker, signal, df)
