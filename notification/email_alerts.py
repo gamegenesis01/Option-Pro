@@ -3,11 +3,14 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+# Get credentials from environment (GitHub Secrets)
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 TO_EMAIL = os.getenv("TO_EMAIL")
 
 def send_email_alert(trades):
+    print("📨 Entered send_email_alert()...")  # DEBUG LINE
+
     subject = "📈 Option Pro – New Trade Ideas"
     body = "Here are the latest options trades to consider:\n\n"
 
