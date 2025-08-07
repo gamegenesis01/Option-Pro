@@ -2,7 +2,7 @@ import pandas as pd
 import time
 from datetime import datetime
 from core.fetch_data import get_price_data
-from core.signals import generate_signals
+from core.signals import generate_trade_ideas
 from core.strategy import find_trade_opportunity
 from core.filter_options import get_best_option
 from notification.email_alerts import send_email_alert
