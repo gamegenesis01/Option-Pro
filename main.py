@@ -1,7 +1,7 @@
 import yfinance as yf
 import pandas as pd
 from datetime import datetime
-from core.signals import generate_signals
+from core.signals import generate_trade_ideas
 from core.emailer import send_email
 
 TICKERS = ["SPY", "AAPL", "TSLA", "MSFT", "AMZN", "GOOGL", "NVDA", "META", "NFLX", "AMD", "AAL", "PLTR", "F", "RIVN", "SOFI"]
