@@ -1,77 +1,70 @@
+# main.py
 import os
-import pandas as pd
 from datetime import datetime
-from core.fetch_data import get_price_data
-from core.signals import generate_signal
-from core.filter_options import get_best_option
+import pandas as pd
+
+from core.signals import generate_trade_ideas
 from core.emailer import send_email
 
-TICKERS = [
-    "SPY","AAPL","TSLA","MSFT","AMZN","GOOGL",
-    "NVDA","META","NFLX","AMD","AAL","PLTR","F","RIVN","SOFI"
-]
+# === CONFIG ===
+TICKERS = ["SPY","AAPL","TSLA","MSFT","AMZN","GOOGL","NVDA","META","NFLX","AMD","AAL","PLTR","F","RIVN","SOFI"]
+HORIZON_HOURS = int(os.getenv("HORIZON_HOURS", "2"))     # 1-3 hours is your spec
+IV_CHANGE_PTS = float(os.getenv("IV_CHANGE_PTS", "0.0"))  # 1.0 = +1 vol point (0.01)
+MIN_ROI_PCT   = float(os.getenv("MIN_ROI_PCT", "12.0"))   # only alert if ROI >= this
+DTE_MIN       = int(os.getenv("DTE_MIN", "2"))
+DTE_MAX       = int(os.getenv("DTE_MAX", "10"))
+STRIKES_RANGE = int(os.getenv("STRIKES_RANGE", "2"))
 
 def log(msg: str):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-def run_bot():
-    os.makedirs("output", exist_ok=True)
-
-    log("🔁 Running Option Pro bot...")
-    trade_ideas = []
-
-    for ticker in TICKERS:
-        try:
-            df = get_price_data(ticker, period="2d", interval="5m")
-            if df is None or df.empty:
-                log(f"[{ticker}] ⚠️ No data.")
-                continue
-
-            sig = generate_signal(df)  # returns {"bias": ..., "rsi": ...}
-            rsi = sig["rsi"]
-
-            if sig["bias"] is None:
-                log(f"[{ticker}] ❌ No signal (RSI {rsi}).")
-                continue
-
-            # Map bias -> option direction/type
-            trade_stub = {
-                "Ticker": ticker,
-                "Type": "Call" if sig["bias"] == "bullish" else "Put",
-                "Direction": "up" if sig["bias"] == "bullish" else "down",
-            }
-
-            idea = get_best_option(ticker, trade_stub)  # your existing (mock) picker
-            if idea:
-                idea["RSI"] = rsi
-                trade_ideas.append(idea)
-                log(f"[{ticker}] ✅ {idea['Type']} idea (RSI {rsi}).")
-            else:
-                log(f"[{ticker}] ⚠️ No option idea produced.")
-
-        except Exception as e:
-            log(f"[{ticker}] ⚠️ Error: {e}")
-
-    # Email either way
+def format_trade_email(trade_ideas):
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    subject = f"Option Pro – {len(trade_ideas)} idea(s) [{ts}]"
+    lines = [subject, f"Horizon: {HORIZON_HOURS}h, Δσ: {IV_CHANGE_PTS}pt(s)", ""]
+    for t in trade_ideas:
+        lines.append(
+            f"{t['Ticker']} {t['Type']} {t['Strike']} | Exp {t['Expiration']} | "
+            f"Buy ${t['Buy Price']:.2f} → Est Sell ${t['Sell Price']:.2f} | "
+            f"ΔOpt ${t['Expected Change']:.2f} | ROI {t['ROI']:.1f}% | "
+            f"Δ {t['Delta']:.2f} Γ {t['Gamma']:.3f} Θ {t['Theta']:.3f} V {t['Vega']:.3f}"
+        )
+    body = "\n".join(lines)
+    return subject, body
 
-    if trade_ideas:
-        df_out = pd.DataFrame(trade_ideas)
-        df_out.to_csv("output/trade_ideas.csv", index=False)
-        body = "Here are the latest ideas:\n\n" + "\n".join(
-            f"{t['Ticker']} {t['Type']} | Exp {t['Expiration']} | "
-            f"Buy ${t['Buy Price']} -> Sell ${t['Sell Price']} | "
-            f"Profit ${t['Profit']} | P({t['Probability']}%) | RSI {t.get('RSI','-')}"
-            for t in trade_ideas
-        )
-        send_email(f"Option Pro – {len(trade_ideas)} idea(s) [{ts}]", body)
-        log(f"✅ Emailed {len(trade_ideas)} idea(s).")
+def format_no_trade_email(reason: str = "No contracts met ROI threshold."):
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    subject = f"Option Pro – No Trade Ideas [{ts}]"
+    body = (
+        f"Bot ran successfully.\n"
+        f"Horizon: {HORIZON_HOURS}h, Δσ: {IV_CHANGE_PTS}pt(s)\n"
+        f"Reason: {reason}"
+    )
+    return subject, body
+
+def run():
+    log("🔁 Running Option Pro (Greeks/Taylor)…")
+
+    ideas = generate_trade_ideas(
+        TICKERS,
+        horizon_hours=HORIZON_HOURS,
+        iv_change_pts=IV_CHANGE_PTS,
+        min_roi_pct=MIN_ROI_PCT,
+        dte_min=DTE_MIN,
+        dte_max=DTE_MAX,
+        strikes_range=STRIKES_RANGE,
+    )
+
+    if ideas:
+        os.makedirs("output", exist_ok=True)
+        pd.DataFrame(ideas).to_csv("output/trade_ideas.csv", index=False)
+        subject, body = format_trade_email(ideas)
+        send_email(subject, body)
+        log(f"✅ Emailed {len(ideas)} idea(s).")
     else:
-        send_email(
-            f"Option Pro – No Trade Ideas [{ts}]",
-            "Bot ran successfully (5m timeframe) but found no setups within RSI 35/65."
-        )
+        subject, body = format_no_trade_email()
+        send_email(subject, body)
         log("⚠️ No trade ideas this run (email sent).")
 
 if __name__ == "__main__":
-    run_bot()
+    run()
