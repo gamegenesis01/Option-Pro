@@ -2,8 +2,8 @@ name: Run Option Pro Bot
 
 on:
   schedule:
-    - cron: '0 * * * *'  # Run every hour
-  workflow_dispatch:      # Allow manual trigger
+    - cron: "*/20 14-20 * * 1-5"  # Every 20 min from 9:00 AM–3:59 PM CT, Mon–Fri
+  workflow_dispatch:               # Allow manual trigger
 
 jobs:
   run-bot:
