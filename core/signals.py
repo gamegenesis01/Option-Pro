@@ -1,20 +1,76 @@
-import pandas as pd
-import ta
+# core/signals.py
+from typing import List, Dict
+from core.forecast import forecast_stock_move
+from core.options import get_atm_options
 
-def generate_signal(df: pd.DataFrame, rsi_window: int = 14, low: float = 35, high: float = 65):
+def taylor_option_price_change(opt: Dict, price_move: float, iv_change: float, days_forward: int) -> float:
     """
-    Compute RSI and return a signal dict.
-    Returns:
-      {"bias": "bullish"/"bearish"/None, "rsi": float}
+    Approximate change in option price using Taylor Series expansion
+    based on given underlying price move, IV change, and days forward.
     """
-    d = df.copy()
-    d["rsi"] = ta.momentum.RSIIndicator(d["Close"], window=rsi_window).rsi()
+    delta = opt["delta"]
+    gamma = opt["gamma"]
+    theta = opt["theta"]
+    vega = opt["vega"]
+    rho = opt["rho"]
 
-    rsi_now = float(d["rsi"].iloc[-1])
+    # Taylor Series expansion:
+    change = (
+        (delta * price_move) +
+        (0.5 * gamma * (price_move ** 2)) +
+        (theta * days_forward) +
+        (vega * iv_change) +
+        (rho * 0)  # ignoring rate change for now
+    )
+    return change
 
-    if rsi_now <= low:
-        return {"bias": "bullish", "rsi": round(rsi_now, 2)}
-    if rsi_now >= high:
-        return {"bias": "bearish", "rsi": round(rsi_now, 2)}
+def generate_trade_ideas(tickers: List[str]) -> List[Dict]:
+    """
+    For each ticker:
+      1. Forecast price move & IV change
+      2. Get ATM options within near DTE
+      3. Calculate Taylor-estimated price change
+      4. Pick top opportunities
+    """
+    trade_ideas = []
 
-    return {"bias": None, "rsi": round(rsi_now, 2)}
+    for t in tickers:
+        try:
+            forecast = forecast_stock_move(t)
+            if not forecast:
+                print(f"[{t}] ⚠️ No forecast data.")
+                continue
+
+            price_move = forecast["price_move"]
+            iv_change = forecast["iv_change"]
+            days_forward = forecast["days_forward"]
+
+            options = get_atm_options(t)
+            if not options:
+                print(f"[{t}] ⚠️ No option data.")
+                continue
+
+            for opt in options:
+                change = taylor_option_price_change(opt, price_move, iv_change, days_forward)
+                if change > 0.5:  # threshold in dollars for trade
+                    trade_ideas.append({
+                        "ticker": t,
+                        "type": opt["type"],
+                        "strike": opt["strike"],
+                        "expiration": opt["expiration"],
+                        "spot": opt["spot"],
+                        "est_change": round(change, 2),
+                        "lastPrice": opt["lastPrice"],
+                        "bid": opt["bid"],
+                        "ask": opt["ask"],
+                        "iv": opt["impliedVolatility"],
+                        "delta": opt["delta"],
+                        "gamma": opt["gamma"],
+                        "theta": opt["theta"],
+                        "vega": opt["vega"]
+                    })
+
+        except Exception as e:
+            print(f"[{t}] ⚠️ Error: {e}")
+
+    return trade_ideas
