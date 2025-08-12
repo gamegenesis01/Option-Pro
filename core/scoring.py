@@ -1,0 +1,177 @@
+# core/scoring.py 
+from typing import Dict, Tuple, List
+
+def _clip(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def _nz(x, default=0.0) -> float:
+    try:
+        if x is None: 
+            return default
+        if isinstance(x, (int, float)):
+            return float(x)
+        return float(x)  # last resort
+    except Exception:
+        return default
+
+def score_contract(feat: Dict[str, float]) -> Tuple[float, List[str]]:
+    """
+    Input features (all optional; missing values treated safely):
+      # Core payoff/greeks
+      roi_pct              : Taylor-estimated % return over the horizon
+      delta_abs            : |delta|
+      gamma                : gamma (scaled already in features)
+      theta_penalty        : negative impact (>=0 means worse)
+      vega_iv_benefit      : expected vega * iv change benefit
+
+      # Underlying movement / regime
+      gap_pct              : overnight gap % (absolute)
+      mom_1h, mom_3h       : short momentum measures (signed %)
+      regime_open, regime_midday, regime_close : {0,1}
+
+      # Liquidity / tradability
+      oi                   : open interest
+      vol                  : today contract volume
+      spread_pct           : bid/ask width divided by mid (e.g., 0.18 = 18%)
+      price                : option mid price
+
+      # IV context
+      iv                   : current implied vol (decimal)
+      iv_1d_chg_pts        : day-over-day change in vol points (e.g., +0.8)
+      iv_percentile_30d    : 0..1 percentile of IV over 30 days
+
+    Returns:
+      composite score in [0, 100], and a list of brief reasons for the score.
+    """
+
+    # ---------- Pull with safe defaults ----------
+    roi_pct           = _nz(feat.get("roi_pct"), 0.0)
+    delta_abs         = _nz(feat.get("delta_abs"), 0.0)
+    gamma_s           = _nz(feat.get("gamma_s"), 0.0)           # scaled gamma from features
+    theta_penalty     = _nz(feat.get("theta_penalty"), 0.0)     # ≥0
+    vega_iv_benefit   = _nz(feat.get("vega_iv_benefit"), 0.0)
+
+    gap_pct           = _nz(feat.get("gap_pct"), 0.0)
+    mom_1h            = _nz(feat.get("mom_1h"), 0.0)
+    mom_3h            = _nz(feat.get("mom_3h"), 0.0)
+    regime_open       = 1.0 if _nz(feat.get("regime_open"), 0.0) > 0 else 0.0
+    regime_midday     = 1.0 if _nz(feat.get("regime_midday"), 0.0) > 0 else 0.0
+    regime_close      = 1.0 if _nz(feat.get("regime_close"), 0.0) > 0 else 0.0
+
+    oi                = _nz(feat.get("oi"), 0.0)
+    vol               = _nz(feat.get("vol"), 0.0)
+    spread_pct        = _nz(feat.get("spread_pct"), 1.0)
+    price             = _nz(feat.get("price"), 0.0)
+
+    iv                = _nz(feat.get("iv"), 0.0)
+    iv_1d_chg_pts     = _nz(feat.get("iv_1d_chg_pts"), 0.0)
+    iv_pct_30d        = _nz(feat.get("iv_percentile_30d"), 0.5)
+
+    # ---------- Normalizations / caps ----------
+    # ROI: cap at +/- 60% for scoring; then scale to 0..1
+    roi_cap = _clip(roi_pct, -60.0, 60.0)
+    roi_p   = (roi_cap + 60.0) / 120.0  # -60 -> 0.0, 0 -> 0.5, +60 -> 1.0
+
+    # Delta sweet spot around 0.3–0.6 for directional options
+    # We reward 0.25..0.65, penalize extremes
+    delta_p = 1.0 - abs((delta_abs - 0.45) / 0.45)  # peaks at 0.45
+    delta_p = _clip(delta_p, 0.0, 1.0)
+
+    # Gamma scaled already; clip 0..1
+    gamma_p = _clip(gamma_s, 0.0, 1.0)
+
+    # Theta penalty (higher is worse); convert to 0..1 goodness
+    theta_p = 1.0 - _clip(theta_penalty, 0.0, 1.0)
+
+    # Vega benefit (negative allowed); map roughly -20%..+20% to 0..1
+    vega_b  = _clip(vega_iv_benefit, -0.2, 0.2)
+    vega_p  = (vega_b + 0.2) / 0.4
+
+    # Gap regime helper (big gaps: early regime confidence)
+    gap_p   = _clip(gap_pct / 3.0, 0.0, 1.0)  # 0–3%+
+
+    # Momentum: map -3%..+3% to 0..1
+    m1 = _clip(mom_1h / 3.0, -1.0, 1.0); m1 = (m1 + 1.0) / 2.0
+    m3 = _clip(mom_3h / 3.0, -1.0, 1.0); m3 = (m3 + 1.0) / 2.0
+
+    # Liquidity & tradability
+    # OI and vol saturation: more is better up to a point
+    oi_p   = _clip(oi / 2000.0, 0.0, 1.0)
+    vol_p  = _clip(vol / 5000.0, 0.0, 1.0)
+    # Spread: 0% is best; 35%+ is terrible
+    spr_p  = 1.0 - _clip(spread_pct / 0.35, 0.0, 1.0)
+    # Price sweet spot: $0.15–$4 (avoid dust & super deep ITM)
+    if price <= 0.1:
+        price_p = 0.0
+    elif price >= 8.0:
+        price_p = 0.2
+    else:
+        # Favor $0.5–$3
+        center = 1.75
+        price_p = 1.0 - min(abs(price - center) / 2.0, 1.0)
+
+    # IV context: avoid top 10% IV unless strategy is long vega; slight preference mid
+    ivp = 1.0 - abs(_clip(iv_pct_30d, 0.0, 1.0) - 0.6)  # peak ~60th pct
+    ivp = _clip(ivp, 0.0, 1.0)
+
+    # Regime multipliers
+    regime_boost = 1.0
+    if regime_open:
+        regime_boost = 1.08 + 0.12 * gap_p  # up to ~1.2 on large gaps
+    elif regime_close:
+        regime_boost = 1.05
+    # midday default 1.0
+
+    # ---------- Weights (tune via backtests) ----------
+    w = {
+        "roi": 0.35,
+        "delta": 0.08,
+        "gamma": 0.10,
+        "theta": 0.07,
+        "vega": 0.08,
+        "gap": 0.05,
+        "mom1": 0.07,
+        "mom3": 0.05,
+        "oi": 0.05,
+        "vol": 0.03,
+        "spread": 0.05,
+        "price": 0.02,
+        "ivctx": 0.05,
+    }
+
+    base = (
+        w["roi"]   * roi_p   +
+        w["delta"] * delta_p +
+        w["gamma"] * gamma_p +
+        w["theta"] * theta_p +
+        w["vega"]  * vega_p  +
+        w["gap"]   * gap_p   +
+        w["mom1"]  * m1      +
+        w["mom3"]  * m3      +
+        w["oi"]    * oi_p    +
+        w["vol"]   * vol_p   +
+        w["spread"]* spr_p   +
+        w["price"] * price_p +
+        w["ivctx"] * ivp
+    )
+
+    # Apply regime scaling and convert to 0..100
+    score = _clip(base * regime_boost, 0.0, 1.0) * 100.0
+
+    # ---------- Reasons (short bullets) ----------
+    reasons: List[str] = []
+    if roi_pct > 8: reasons.append(f"ROI {roi_pct:.0f}%")
+    if delta_abs >= 0.25 and delta_abs <= 0.65: reasons.append(f"delta~{delta_abs:.2f}")
+    if gamma_s > 0.5: reasons.append("high γ")
+    if vega_iv_benefit > 0.0: reasons.append("vega+")
+    if spread_pct < 0.2: reasons.append("tight spread")
+    if oi > 500: reasons.append("liquid")
+    if regime_open and gap_pct > 0.5: reasons.append("open gap")
+
+    # Flag common negatives for transparency
+    if spread_pct >= 0.35: reasons.append("wide spread")
+    if oi < 100: reasons.append("thin OI")
+    if price <= 0.15: reasons.append("dusty")
+    if theta_penalty > 0.5: reasons.append("theta drag")
+
+    return float(score), reasons
