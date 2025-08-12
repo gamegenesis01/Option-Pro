@@ -1,44 +1,47 @@
-import numpy as np
+# core/scoring.py
 
-def _norm_clip(x, lo, hi):
-    return float(np.clip((x - lo) / (hi - lo), 0.0, 1.0))
+from typing import List, Dict
 
-def score_signal(snap: dict, z_abs: float, cfg: dict, direction: str) -> float:
+def score_contracts(contracts: List[Dict]) -> List[Dict]:
     """
-    Build a 0..1 score from RSI, MACD hist, EMA trend, and |zscore|.
-    Direction-aware: for CALL, lower RSI is better; for PUT, higher RSI is better.
+    Assigns a score to each option contract based on a mix of liquidity and volatility factors.
+
+    Parameters
+    ----------
+    contracts : List[Dict]
+        List of option contract dictionaries.
+        Expected keys: 'volume', 'openInterest', 'impliedVolatility', 'lastPrice'
+
+    Returns
+    -------
+    List[Dict]
+        The same list of contracts, each with an added 'score' key.
     """
-    w_rsi   = cfg["w_rsi"]
-    w_macd  = cfg["w_macd"]
-    w_trend = cfg["w_trend"]
-    w_z     = cfg["w_zscore"]
+    
+    scored = []
+    for c in contracts:
+        try:
+            volume = float(c.get("volume", 0))
+            oi = float(c.get("openInterest", 0))
+            iv = float(c.get("impliedVolatility", 0))
+            price = float(c.get("lastPrice", 0))
 
-    rsi = snap["rsi"]
-    macd = snap["macd_hist"]
-    trend = snap["ema_trend"]
+            # Basic scoring formula (you can tune weights later)
+            score = (
+                (volume / 1000) * 0.4 +     # liquidity weight
+                (oi / 1000) * 0.3 +         # open interest weight
+                (iv * 100) * 0.2 +          # implied volatility weight
+                (price / 10) * 0.1          # price factor
+            )
 
-    # RSI component
-    if direction == "CALL":
-        rsi_component = _norm_clip(60.0 - rsi, 0.0, 30.0)  # RSI 30 → 1.0, 60 → 0.0
-    else:
-        rsi_component = _norm_clip(rsi - 40.0, 0.0, 30.0)  # RSI 70 → 1.0, 40 → 0.0
+            c["score"] = round(score, 2)
+            scored.append(c)
 
-    # MACD strength (favor sign aligned with direction)
-    macd_signed = macd if direction == "CALL" else -macd
-    macd_component = _norm_clip(macd_signed, 0.0, 0.10)  # 0..0.1 typical hist range
+        except Exception:
+            # Skip any contract with bad/missing data
+            continue
 
-    # Trend (EMA fast-slow) aligned with direction
-    trend_signed = trend if direction == "CALL" else -trend
-    trend_component = _norm_clip(trend_signed, 0.0, max(0.01, abs(trend_signed) * 2.0))
+    # Sort contracts from highest to lowest score
+    scored.sort(key=lambda x: x.get("score", 0), reverse=True)
 
-    # Zscore of recent move (stretched -> reversal or continuation bias)
-    z_component = _norm_clip(z_abs, 0.5, 2.0)
-
-    score = (
-        w_rsi * rsi_component +
-        w_macd * macd_component +
-        w_trend * trend_component +
-        w_z * z_component
-    )
-
-    return float(np.clip(score, 0.0, 1.0))
+    return scored
