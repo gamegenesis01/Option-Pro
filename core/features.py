@@ -1,237 +1,202 @@
 # core/features.py
+
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
 
-# -----------------------------
-# Config defaults (can be tuned)
-# -----------------------------
-HISTORY_DAYS = 45             # lookback for intraday returns (trading days)
-MIN_BARS = 60                 # minimum 1h bars to consider forecast “ok”
-IV_BOUNDS = (1.0, 200.0)      # % implied vol sanity bounds
-DELTA_BOUNDS = (0.05, 0.95)   # keep away from 0/1 deltas
-MIN_OI = 50                   # min open interest
-MAX_SPREAD_PCT = 35.0         # % of mid
-MONEYNESS_PCT = 8.0           # +/-% around spot for near-money filter
+# ----------------------------
+# Helpers (pure pandas/numpy)
+# ----------------------------
+
+def _rsi(close: pd.Series, window: int = 14) -> pd.Series:
+    """Vanilla RSI implementation without external libs."""
+    delta = close.diff()
+    up = delta.clip(lower=0.0)
+    down = -delta.clip(upper=0.0)
+    # Wilder's smoothing
+    roll_up = up.ewm(alpha=1 / window, adjust=False).mean()
+    roll_down = down.ewm(alpha=1 / window, adjust=False).mean()
+    rs = roll_up / (roll_down.replace(0.0, np.nan))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50.0)
 
 
-@dataclass
-class Forecast:
-    spot: float
-    exp_dS: float        # expected absolute move in underlying over horizon (in $)
-    dvol_pts: float      # expected IV change in vol points (e.g., 0.25, 0.5, 1.0)
-    horizon_h: int
-    source: str          # 'mad', 'realized', or 'fallback'
+def _atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
+    """Average True Range (ATR)."""
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = tr.ewm(alpha=1 / window, adjust=False).mean()
+    return atr
 
 
-def _mad_scale(x: pd.Series) -> float:
-    """Robust scale estimator: median absolute deviation (MAD) scaled to sigma."""
-    med = np.nanmedian(x)
-    mad = np.nanmedian(np.abs(x - med))
-    # For normal data, sigma ≈ MAD / 0.6745
-    return mad / 0.6745 if mad > 0 else np.nan
+def _zscore(series: pd.Series, window: int = 20) -> pd.Series:
+    """Rolling z-score."""
+    mean = series.rolling(window, min_periods=window // 2).mean()
+    std = series.rolling(window, min_periods=window // 2).std(ddof=0)
+    z = (series - mean) / std.replace(0.0, np.nan)
+    return z
 
 
-def get_hourly_history(ticker: str, days: int = HISTORY_DAYS) -> pd.DataFrame:
-    df = yf.download(ticker, period=f"{days}d", interval="1h", auto_adjust=True, progress=False)
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return pd.DataFrame()
-    # Ensure clean column names and drop duplicates/NAs
-    df = df.copy()
-    df = df[~df.index.duplicated(keep="last")]
-    for col in ("Open", "High", "Low", "Close"):
-        if col not in df.columns:
-            return pd.DataFrame()
-    df = df.dropna(subset=["Close"])
-    return df
-
-
-def forecast_move(df: pd.DataFrame, horizon_h: int) -> Tuple[float, str]:
+def _realized_vol_from_logrets(
+    logret: pd.Series, horizon_hours: int, bars_per_hour: Optional[int]
+) -> float:
     """
-    Return expected absolute *fractional* move over horizon (|ΔS|/S),
-    using robust intraday stats with fallback to realized volatility.
+    Estimate per-horizon (h hours) realized volatility (in $ terms per $1 of price)
+    using recent log-return standard deviation and square-root-of-time.
     """
-    # 1h log returns
-    ret = np.log(df["Close"]).diff().dropna()
-    if ret.size < MIN_BARS:
-        # fallback to simple close-to-close realized over longer window
-        realized = float(ret.std()) if ret.size > 5 else np.nan
-        if not np.isfinite(realized) or realized <= 0:
-            return 0.0, "fallback"
-        sigma_1h = realized
-        return abs(sigma_1h) * math.sqrt(max(horizon_h, 1)), "realized"
+    if logret.dropna().empty:
+        return 0.0
 
-    # Robust: MAD-based sigma for 1h returns
-    sigma_robust = _mad_scale(ret)
-    if np.isfinite(sigma_robust) and sigma_robust > 0:
-        sigma_h = sigma_robust * math.sqrt(max(horizon_h, 1))
-        return float(abs(sigma_h)), "mad"
+    # If we know bars/hour (e.g., 1 for hourly, 12 for 5-min), scale properly.
+    # Fallback: infer bars/hour from average spacing.
+    if bars_per_hour is None:
+        bars_per_hour = 1
 
-    # Fallback to standard deviation if MAD fails
-    std = float(ret.std())
-    if not np.isfinite(std) or std <= 0:
-        return 0.0, "fallback"
-    return abs(std) * math.sqrt(max(horizon_h, 1)), "realized"
+    # Recent window for vol estimate (about one trading day of bars)
+    win = max(10, bars_per_hour * 6)
+    sigma_bar = float(logret.tail(win).std(ddof=0))  # per-bar log-ret std
+    sigma_h = sigma_bar * math.sqrt(horizon_hours * bars_per_hour)
+    return sigma_h
 
 
-def estimate_dvol_points(df: pd.DataFrame, horizon_h: int) -> float:
+# -----------------------------------
+# Public API expected by signals.py
+# -----------------------------------
+
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Crude but data-driven ΔIV regime: classify the *current* intraday volatility regime
-    and map it to a likely IV shift over the next few hours.
-
-    - Compute rolling 1h absolute returns; compare last value to its 60-day percentiles.
-    - Map to vol points:
-        small  (<=50th pct) -> +0.25
-        medium (50-80th)    -> +0.50
-        large  (>80th)      -> +1.00
+    Add core features needed downstream.
+    Expected columns: 'Close' (required), 'High'/'Low' (optional but recommended).
+    Returns a NEW DataFrame (does not mutate input).
     """
-    r1 = np.log(df["Close"]).diff().abs().dropna()
-    if r1.size < 50:
-        return 0.5  # conservative default
+    if df is None or df.empty or "Close" not in df.columns:
+        raise ValueError("add_features: input DataFrame must contain 'Close' and not be empty.")
 
-    last = float(r1.iloc[-1])
-    p50, p80 = np.percentile(r1.values, [50, 80])
+    out = df.copy()
 
-    if last <= p50:
-        return 0.25
-    if last <= p80:
-        return 0.50
-    return 1.00
+    # Basic returns
+    out["ret"] = out["Close"].pct_change()
+    out["logret"] = np.log(out["Close"]).diff()
+
+    # Momentum/mean-reversion proxies
+    out["rsi14"] = _rsi(out["Close"], 14)
+    out["z20"] = _zscore(out["Close"], 20)
+
+    # Volatility proxies
+    if all(c in out.columns for c in ["High", "Low", "Close"]):
+        out["atr14"] = _atr(out["High"], out["Low"], out["Close"], 14)
+    else:
+        # Graceful fallback if High/Low missing
+        out["atr14"] = (out["Close"].rolling(14).max() - out["Close"].rolling(14).min()).ffill()
+
+    # Rolling realized vol on log returns (per bar)
+    out["rv_bar_20"] = out["logret"].rolling(20, min_periods=10).std(ddof=0)
+
+    # Moving averages for trend context (not directly used in forecast but useful for scoring)
+    out["ema20"] = out["Close"].ewm(span=20, adjust=False).mean()
+    out["ema50"] = out["Close"].ewm(span=50, adjust=False).mean()
+
+    return out
 
 
-def build_forecast(ticker: str, horizon_h: int) -> Forecast | None:
-    df = get_hourly_history(ticker)
-    if df.empty:
+def latest_snapshot(
+    df_with_features: pd.DataFrame,
+    horizon_hours: int = 2,
+    iv_revert_pts: float = 0.5,
+    bars_per_hour: Optional[int] = None,
+) -> Optional[Dict]:
+    """
+    Produce a single snapshot dict for the most recent bar including:
+      - exp_dS       (expected $ move over horizon)
+      - exp_dIV_pts  (expected IV change in points)
+      - aux context: rsi14, z20, atr14, rv_bar_20
+
+    Heuristic:
+      exp_dS = -meanRevertWeight * z20 * (price * sigma_h)
+      where sigma_h is square-root-of-time scaled recent realized vol (from log returns).
+      meanRevertWeight increases when RSI is extended (<35 or >65).
+    """
+    if df_with_features is None or df_with_features.empty:
         return None
 
-    spot = float(df["Close"].iloc[-1])
-    frac_move, src = forecast_move(df, horizon_h)
-    dS = abs(frac_move) * spot  # dollar move
-    dvol = estimate_dvol_points(df, horizon_h)
-    return Forecast(spot=spot, exp_dS=dS, dvol_pts=dvol, horizon_h=horizon_h, source=src)
+    last = df_with_features.iloc[-1]
+    price = float(last["Close"])
+
+    # Recent realized vol (log space), then convert to $ move scale by multiplying with price.
+    sigma_h_log = _realized_vol_from_logrets(
+        df_with_features["logret"], horizon_hours, bars_per_hour
+    )
+    sigma_h_dollars = price * sigma_h_log  # approximate expected $ stdev over horizon
+
+    # Mean-reversion weight based on RSI stretch
+    rsi = float(last.get("rsi14", 50.0))
+    if rsi >= 65:
+        mr_w = 1.0 + (rsi - 65) / 35.0  # up to ~2.0 if RSI→100
+        direction = -1.0  # expect some giveback
+    elif rsi <= 35:
+        mr_w = 1.0 + (35 - rsi) / 35.0
+        direction = +1.0  # expect bounce
+    else:
+        mr_w = 0.6  # mild reversion bias when neutral
+        direction = 0.0 if abs(float(last.get("z20", 0.0))) < 0.3 else -np.sign(float(last.get("z20", 0.0)))
+
+    z = float(last.get("z20", 0.0))
+    # Combine zscore & RSI bias
+    reversion_signal = direction if direction != 0.0 else -np.sign(z)
+    magnitude = min(2.5, abs(z))  # cap effect
+
+    exp_dS = mr_w * magnitude * reversion_signal * sigma_h_dollars
+
+    # Simple IV mean-reversion heuristic: small pull toward recent median
+    exp_dIV_pts = float(np.clip(iv_revert_pts, -2.0, 2.0))
+
+    snapshot = {
+        "price": price,
+        "rsi14": rsi,
+        "z20": z,
+        "atr14": float(last.get("atr14", np.nan)),
+        "rv_bar_20": float(last.get("rv_bar_20", np.nan)),
+        "sigma_h_log": float(sigma_h_log),
+        "sigma_h_$": float(sigma_h_dollars),
+        "exp_dS": float(exp_dS),
+        "exp_dIV_pts": float(exp_dIV_pts),
+        "horizon_h": int(horizon_hours),
+    }
+    return snapshot
 
 
-def within_moneyness(spot: float, strike: float, pct: float = MONEYNESS_PCT) -> bool:
-    lo = spot * (1 - pct / 100.0)
-    hi = spot * (1 + pct / 100.0)
-    return (strike >= lo) and (strike <= hi)
-
-
-def sanitize_chain(chain_df: pd.DataFrame, spot: float) -> pd.DataFrame:
+def latest_snapshots(
+    df_with_features_map: Dict[str, pd.DataFrame],
+    horizon_hours: int = 2,
+    iv_revert_pts: float = 0.5,
+    bars_per_hour: Optional[int] = None,
+) -> Dict[str, Dict]:
     """
-    Clean & filter the raw options chain:
-    - Fix bid>ask inversions by swapping
-    - Drop rows with invalid IV, delta, or prices
-    - Enforce OI and spread% constraints
-    - Enforce near-money window
+    Convenience wrapper: run latest_snapshot for multiple tickers.
+    Input: {symbol: df_with_features}
+    Output: {symbol: snapshot_dict}
     """
-    df = chain_df.copy()
-
-    # Normalize column names (in case provider uses lowercase)
-    cols = {c.lower(): c for c in df.columns}
-    # Expected columns: ['symbol','expiry','type','strike','bid','ask','mid','iv','delta','gamma','theta_day','vega','rho','open_interest']
-    req = ["symbol", "expiry", "type", "strike", "bid", "ask", "mid", "iv", "delta", "gamma", "theta_day", "vega", "rho", "open_interest"]
-    for c in req:
-        if c not in df.columns:
-            # Try lowercase
-            lc = c.lower()
-            if lc in cols:
-                df.rename(columns={cols[lc]: c}, inplace=True)
-            else:
-                # If still missing, create safe default
-                if c in ("rho",):
-                    df[c] = 0.0
-                else:
-                    df[c] = np.nan
-
-    # Fix bid/ask inversions
-    mask_inv = df["bid"] > df["ask"]
-    if mask_inv.any():
-        b = df.loc[mask_inv, "bid"].copy()
-        a = df.loc[mask_inv, "ask"].copy()
-        df.loc[mask_inv, "bid"] = a
-        df.loc[mask_inv, "ask"] = b
-
-    # Recompute mid when needed
-    df["mid"] = np.where(df["mid"].isna() | (df["mid"] <= 0), (df["bid"] + df["ask"]) / 2.0, df["mid"])
-
-    # Drop non-positive or NaN mids
-    df = df[np.isfinite(df["mid"]) & (df["mid"] > 0)]
-
-    # Spread %
-    df["spread_pct"] = np.where(df["mid"] > 0, (df["ask"] - df["bid"]) / df["mid"] * 100.0, np.inf)
-
-    # Filters
-    iv_lo, iv_hi = IV_BOUNDS
-    df = df[
-        (np.isfinite(df["iv"])) & (df["iv"] >= iv_lo) & (df["iv"] <= iv_hi) &
-        (np.isfinite(df["delta"])) & (df["delta"].abs() >= DELTA_BOUNDS[0]) & (df["delta"].abs() <= DELTA_BOUNDS[1]) &
-        (np.isfinite(df["open_interest"])) & (df["open_interest"] >= MIN_OI) &
-        (np.isfinite(df["spread_pct"])) & (df["spread_pct"] <= MAX_SPREAD_PCT) &
-        df["strike"].apply(lambda k: within_moneyness(spot, float(k), MONEYNESS_PCT))
-    ]
-
-    # Keep reasonable gammas/vegas if present
-    for col in ("gamma", "vega", "theta_day"):
-        if col in df.columns:
-            df = df[np.isfinite(df[col])]
-
-    return df.reset_index(drop=True)
-
-
-def taylor_expected_change(row: pd.Series, exp_dS: float, dvol_pts: float, horizon_h: int) -> Tuple[float, float]:
-    """
-    Taylor approximation of option price change over horizon.
-    - exp_change: dollars
-    - exp_roi: percent of mid
-    """
-    delta = float(row.get("delta", 0.0))
-    gamma = float(row.get("gamma", 0.0))
-    theta_day = float(row.get("theta_day", 0.0))  # $/day
-    vega = float(row.get("vega", 0.0))
-    rho = float(row.get("rho", 0.0))
-    mid = float(row.get("mid", np.nan))
-
-    if not np.isfinite(mid) or mid <= 0:
-        return (np.nan, np.nan)
-
-    dS = exp_dS
-    dt_days = max(horizon_h, 1) / 24.0
-    dIV = dvol_pts  # already in vol points
-
-    # We assume Δr ≈ 0 over a few hours
-    exp_change = (delta * dS) + (0.5 * gamma * (dS ** 2)) + (theta_day * dt_days) + (vega * dIV)
-    exp_roi = (exp_change / mid) * 100.0
-    return float(exp_change), float(exp_roi)
-
-
-def score_contracts(chain_df: pd.DataFrame, forecast: Forecast) -> pd.DataFrame:
-    """
-    Add expected change & ROI to chain, return enriched table sorted by ROI desc.
-    """
-    if chain_df.empty or forecast is None:
-        return pd.DataFrame()
-
-    df = sanitize_chain(chain_df, forecast.spot)
-    if df.empty:
-        return df
-
-    exp_changes, exp_rois = [], []
-    for _, row in df.iterrows():
-        chg, roi = taylor_expected_change(row, forecast.exp_dS, forecast.dvol_pts, forecast.horizon_h)
-        exp_changes.append(chg)
-        exp_rois.append(roi)
-
-    df["exp_change"] = exp_changes
-    df["exp_roi"] = exp_rois
-
-    # Drop rows where we couldn't compute
-    df = df[np.isfinite(df["exp_roi"])]
-    return df.sort_values("exp_roi", ascending=False).reset_index(drop=True)
+    out: Dict[str, Dict] = {}
+    for sym, dfx in (df_with_features_map or {}).items():
+        try:
+            snap = latest_snapshot(
+                dfx, horizon_hours=horizon_hours, iv_revert_pts=iv_revert_pts, bars_per_hour=bars_per_hour
+            )
+            if snap is not None:
+                out[sym] = snap
+        except Exception as e:
+            # Keep going even if one symbol fails
+            out[sym] = {"error": str(e)}
+    return out
