@@ -20,7 +20,7 @@ from .features import (
 #   Required columns in the returned DataFrame:
 #   ['symbol','expiry','type','strike','bid','ask','mid','iv',
 #    'delta','gamma','theta_day','vega','rho','open_interest']
-from . import fetch
+from . import fetch_data as fetch
 
 
 # -----------------------------
