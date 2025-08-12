@@ -3,7 +3,7 @@ import os
 from datetime import datetime
 
 from core.signals import generate_ranked_ideas
-from notifications.email_alerts import send_email_alert
+from notification.email_alerts import send_email_alert
 
 
 # ----------------------- Configuration -----------------------
