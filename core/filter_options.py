@@ -1,4 +1,3 @@
-# core/filter_options.py
 from __future__ import annotations
 from typing import List, Dict, Any, Tuple
 import os
@@ -11,7 +10,6 @@ def _nz(x, d=0.0):
         return d
 
 def _spread_pct(row: Dict[str, Any]) -> float:
-    # Prefer cached calc if present
     sp = row.get("spread_pct")
     if sp is not None:
         try: return float(sp)
@@ -45,52 +43,45 @@ def filter_candidates(
     cfg: Dict[str, Any] | None = None
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Looser, hedge‑fund‑style gating + tiering with a watchlist fallback.
+    Looser gating + tiering with a watchlist fallback.
     Returns: (tier1, tier2, watchlist, stats)
     """
     cfg = cfg or {}
 
-    # ---- Tunables (env var -> cfg -> default) ----
     MIN_OI         = int(os.getenv("MIN_OI",        cfg.get("MIN_OI",        50)))
-    MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", cfg.get("MAX_SPREAD_PCT", 0.50)))  # 50%
+    MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", cfg.get("MAX_SPREAD_PCT", 0.50)))
     DTE_MIN        = int(os.getenv("DTE_MIN",       cfg.get("DTE_MIN",        0)))
     DTE_MAX        = int(os.getenv("DTE_MAX",       cfg.get("DTE_MAX",       21)))
     MIN_PRICE      = float(os.getenv("MIN_PRICE",   cfg.get("MIN_PRICE",     0.10)))
     MAX_PRICE      = float(os.getenv("MAX_PRICE",   cfg.get("MAX_PRICE",    10.00)))
     STRIKES_RANGE  = int(os.getenv("STRIKES_RANGE", cfg.get("STRIKES_RANGE", 8)))
 
-    # Tier cutoffs (soft — we’ll still produce a watchlist)
     MIN_SCORE_T1   = float(os.getenv("MIN_SCORE_TIER1", cfg.get("MIN_SCORE_TIER1", 72)))
     MIN_SCORE_T2   = float(os.getenv("MIN_SCORE_TIER2", cfg.get("MIN_SCORE_TIER2", 60)))
-
     WATCHLIST_TOP  = int(os.getenv("WATCHLIST_TOP", cfg.get("WATCHLIST_TOP", 5)))
 
     stats = dict(missing_iv=0, thin_oi=0, wide_spread=0, bad_dte=0, bad_price=0,
                  out_of_range=0, ok=0)
 
     gated: List[Dict[str, Any]] = []
-    relaxed: List[Dict[str, Any]] = []   # candidates that fail one rule but have high score
+    relaxed: List[Dict[str, Any]] = []
 
-    # ---- Hard(ish) gate with soft bypasses ----
     for r in candidates:
-        # Expect these fields to be present from earlier steps, but guard anyway
-        r = dict(r)  # shallow copy (we may add flags)
+        r = dict(r)
         r.setdefault("flags", [])
         oi   = _nz(r.get("openInterest"), 0.0)
         dte  = float(r.get("dte", r.get("daysToExpiration", 999)))
         mid  = _nz(r.get("mid") or r.get("price") or r.get("lastPrice"), 0.0)
         sc   = _nz(r.get("score"), 0.0)
         spr  = _spread_pct(r)
-        rng  = abs(_nz(r.get("strikeDistance", 0.0)))  # strikes away from spot, if provided
+        rng  = abs(_nz(r.get("strikeDistance", 0.0)))
 
-        # Flags & counters
         if oi < MIN_OI: stats["thin_oi"] += 1
         if spr > MAX_SPREAD_PCT: stats["wide_spread"] += 1
         if dte < DTE_MIN or dte > DTE_MAX: stats["bad_dte"] += 1
         if mid < MIN_PRICE or mid > MAX_PRICE: stats["bad_price"] += 1
         if STRIKES_RANGE and rng > STRIKES_RANGE: stats["out_of_range"] += 1
 
-        # Primary pass
         hard_ok = (
             oi >= MIN_OI and
             spr <= MAX_SPREAD_PCT and
@@ -99,7 +90,6 @@ def filter_candidates(
             (rng <= STRIKES_RANGE if STRIKES_RANGE else True)
         )
 
-        # Soft bypass: allow high‑score names to pass if only slightly off
         soft_ok = (
             sc >= MIN_SCORE_T1 and
             oi >= max(20, 0.5 * MIN_OI) and
@@ -116,18 +106,13 @@ def filter_candidates(
             r["flags"].append("soft-pass")
             relaxed.append(r)
         else:
-            # Keep for possible watchlist if we have almost nothing
             r["flags"].append("reject")
 
-    # Merge soft‑pass into the pool, de‑dupe by (ticker, contract symbol) if provided
     pool = gated + relaxed
-    # Stable sort by score descending
     pool.sort(key=lambda x: _nz(x.get("score"), 0.0), reverse=True)
 
-    # Split into T1 / T2
     tier1, tier2 = _tier_split(pool, MIN_SCORE_T1, MIN_SCORE_T2)
 
-    # Watchlist fallback (only if T1/T2 empty or tiny)
     watchlist: List[Dict[str, Any]] = []
     if len(tier1) + len(tier2) < max(3, WATCHLIST_TOP // 2):
         for r in pool:
