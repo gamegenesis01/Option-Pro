@@ -1,134 +1,135 @@
-# main.py
+from __future__ import annotations
 import os
 from datetime import datetime
-import pandas as pd
+from typing import Any, Dict, List, Tuple
 
-from core.signals import generate_ranked_ideas
-from core.emailer import send_email
+from core.signals import generate_ranked_ideas   # existing module in your repo
+from core.emailer import send_email              # existing mailer
 
-# ===== Config (env‑tunable) =====
-TICKERS = os.getenv(
-    "TICKERS",
-    "SPY,AAPL,TSLA,MSFT,AMZN,GOOGL,NVDA,META,NFLX,AMD,AAL,PLTR,F,RIVN,SOFI"
-).split(",")
+# --------- runtime config ---------
+TICKERS = [
+    "SPY", "AAPL", "TSLA", "MSFT", "AMZN",
+    "GOOGL", "NVDA", "META", "NFLX", "AMD",
+    "AAL", "PLTR", "F", "RIVN", "SOFI",
+]
 
-HORIZON_HOURS   = int(os.getenv("HORIZON_HOURS", "2"))
-IV_CHANGE_PTS   = float(os.getenv("IV_CHANGE_PTS", "0.5"))   # assume +0.5 vol-pt
-MIN_SCORE_TIER1 = float(os.getenv("MIN_SCORE_TIER1", "80"))
-MIN_SCORE_TIER2 = float(os.getenv("MIN_SCORE_TIER2", "60"))
-DTE_MIN         = int(os.getenv("DTE_MIN", "0"))
-DTE_MAX         = int(os.getenv("DTE_MAX", "14"))
-STRIKES_RANGE   = int(os.getenv("STRIKES_RANGE", "8"))
-TOPN_FALLBACK   = int(os.getenv("TOPN_FALLBACK", "5"))
-MIN_OI          = int(os.getenv("MIN_OI", "100"))
-MAX_SPREAD_PCT  = float(os.getenv("MAX_SPREAD_PCT", "0.35"))
+HORIZON_HOURS = int(os.getenv("HORIZON_HOURS", 2))
+BIAS_MODE = os.getenv("BIAS_MODE", "revert")  # or "trend"
 
-def _now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+# Looser gating settings (match filter_options defaults)
+FILTER_CFG: Dict[str, Any] = {
+    "MIN_OI": 50,
+    "MAX_SPREAD_PCT": 0.50,
+    "DTE_MIN": 0,
+    "DTE_MAX": 21,
+    "MIN_PRICE": 0.10,
+    "MAX_PRICE": 10.00,
+    "STRIKES_RANGE": 8,
+    "MIN_SCORE_TIER1": 72,
+    "MIN_SCORE_TIER2": 60,
+    "WATCHLIST_TOP": 5,
+}
 
-def _row_line(r):
-    return (f"{r['Ticker']} {r['Type']} {r['Strike']} | Exp {r['Expiration']} | "
-            f"Mid ${r['Buy Price']:.2f} → Est ${r['Sell Price']:.2f} | "
-            f"Δ ${r['Expected Change']:.2f} | ROI {r['ROI']:.1f}% | "
-            f"Score {r['Score']:.1f} | Δ {r['Delta']:.2f} Γ {r['Gamma']:.3f} "
-            f"Θ {r['Theta']:.4f} V {r['Vega']:.4f} | DTE {r['DTE']} | IV {r['IV']:.3f}")
+HEADER_LINE = (
+    f"horizon={HORIZON_HOURS}h, "
+    f"DTE[{FILTER_CFG['DTE_MIN']}–{FILTER_CFG['DTE_MAX']}], "
+    f"${FILTER_CFG['MIN_PRICE']:.2f}-${FILTER_CFG['MAX_PRICE']:.2f}, "
+    f"minOI={FILTER_CFG['MIN_OI']}, "
+    f"maxSpread={int(FILTER_CFG['MAX_SPREAD_PCT']*100)}%"
+)
 
-def _html_table(rows, title):
+# --------- helpers ---------
+def _format_rows(rows: List[Dict[str, Any]]) -> str:
     if not rows:
-        return f"<h3>{title}</h3><p>None</p>"
-    th = ("<tr><th>Ticker</th><th>Type</th><th>Strike</th><th>Exp</th>"
-          "<th>Mid</th><th>Est</th><th>Δ</th><th>ROI%</th><th>Score</th>"
-          "<th>Δ</th><th>Γ</th><th>Θ</th><th>V</th><th>DTE</th><th>IV</th><th>Reasons</th></tr>")
-    trs = []
+        return "None"
+    lines = []
     for r in rows:
-        trs.append(
-            "<tr>"
-            f"<td>{r['Ticker']}</td><td>{r['Type']}</td><td>{r['Strike']}</td>"
-            f"<td>{r['Expiration']}</td><td>{r['Buy Price']:.2f}</td>"
-            f"<td>{r['Sell Price']:.2f}</td><td>{r['Expected Change']:.2f}</td>"
-            f"<td>{r['ROI']:.1f}</td><td>{r['Score']:.1f}</td>"
-            f"<td>{r['Delta']:.2f}</td><td>{r['Gamma']:.3f}</td>"
-            f"<td>{r['Theta']:.4f}</td><td>{r['Vega']:.4f}</td>"
-            f"<td>{r['DTE']}</td><td>{r['IV']:.3f}</td>"
-            f"<td>{', '.join(r.get('Reasons', []))}</td>"
-            "</tr>"
-        )
-    return f"<h3>{title}</h3><table border='1' cellpadding='6' cellspacing='0'>{th}{''.join(trs)}</table>"
+        sym = r.get("symbol") or r.get("contractSymbol") or r.get("ticker", "?")
+        dirn = r.get("side") or r.get("direction", "?")
+        strike = r.get("strike", "?")
+        dte = r.get("dte", r.get("daysToExpiration", "?"))
+        mid = r.get("mid", r.get("price", r.get("lastPrice", "?")))
+        score = r.get("score", "?")
+        reason = r.get("reason", "")
+        lines.append(f"- {sym} {dirn} @ {strike} (DTE {dte}, mid {mid}, score {score}) {reason}")
+    return "\n".join(lines)
 
+def _build_email(
+    tier1: List[Dict[str, Any]],
+    tier2: List[Dict[str, Any]],
+    watch: List[Dict[str, Any]],
+    debug_lines: List[str]
+) -> Tuple[str, str]:
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    subject = "Option Pro – Ranked Ideas"
+
+    body = []
+    body.append("Option Pro – Ranked Ideas")
+    body.append("")
+    body.append(ts)
+    body.append("")
+    body.append(HEADER_LINE)
+    body.append("")
+    body.append("Tier 1 (High Conviction)")
+    body.append(_format_rows(tier1))
+    body.append("")
+    body.append("Tier 2 (Moderate)")
+    body.append(_format_rows(tier2))
+    body.append("")
+    body.append("Watchlist (Top Fallback)")
+    body.append(_format_rows(watch))
+    body.append("")
+    if debug_lines:
+        body.append("Debug")
+        body.extend(debug_lines)
+
+    return subject, "\n".join(body)
+
+# --------- main run ---------
 def run():
-    print(f"[{_now()}] 🔁 Running Option Pro (ranked)…")
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] 🚀 Running Option Pro (ranked)…")
+
+    # generate_ranked_ideas return type can be tuple or dict depending on your current signals.py.
     result = generate_ranked_ideas(
         tickers=TICKERS,
         horizon_hours=HORIZON_HOURS,
-        iv_change_pts=IV_CHANGE_PTS,
-        min_score_tier1=MIN_SCORE_TIER1,
-        min_score_tier2=MIN_SCORE_TIER2,
-        dte_min=DTE_MIN,
-        dte_max=DTE_MAX,
-        strikes_range=STRIKES_RANGE,
-        topN_fallback=TOPN_FALLBACK,
-        min_oi=MIN_OI,
-        max_spread_pct=MAX_SPREAD_PCT,
+        bias_mode=BIAS_MODE,
+        filter_cfg=FILTER_CFG,
     )
 
-    # Save CSV of all ranked rows
-    os.makedirs("output", exist_ok=True)
-    all_rows = result.get("all", [])
-    if all_rows:
-        pd.DataFrame(all_rows).to_csv("output/trade_ideas_ranked.csv", index=False)
+    # Resilient unpack
+    tier1: List[Dict[str, Any]] = []
+    tier2: List[Dict[str, Any]] = []
+    watch: List[Dict[str, Any]] = []
+    debug_lines: List[str] = []
 
-    # Build email (plain + HTML)
-    ts = _now()
-    tier1, tier2, watch = result["tier1"], result["tier2"], result["watch"]
-    num = len(tier1) + len(tier2)
-    subject = f"Option Pro – {num} high-quality idea(s) [{ts}]"
-
-    # Plaintext
-    lines = [
-        subject,
-        f"Cfg: horizon={HORIZON_HOURS}h, dσ={IV_CHANGE_PTS}pt, DTE[{DTE_MIN}-{DTE_MAX}], ±${STRIKES_RANGE},"
-        f" minOI={MIN_OI}, maxSpread={int(MAX_SPREAD_PCT*100)}%",
-        "",
-    ]
-    if tier1:
-        lines.append("=== Tier 1 ===")
-        lines += [_row_line(r) for r in tier1]
-        lines.append("")
-    if tier2:
-        lines.append("=== Tier 2 ===")
-        lines += [_row_line(r) for r in tier2]
-        lines.append("")
-    if watch:
-        lines.append("=== Watchlist (Top fallback) ===")
-        lines += [_row_line(r) for r in watch]
-        lines.append("")
-    # Append debug logs
-    logs = result.get("logs", [])
-    if logs:
-        lines.append("--- Debug ---")
-        lines += logs
-
-    text_body = "\n".join(lines)
-
-    # HTML
-    html = [
-        f"<h2>Option Pro – Ranked Ideas</h2>",
-        f"<p><b>{ts}</b></p>",
-        f"<p><code>horizon={HORIZON_HOURS}h, dσ={IV_CHANGE_PTS}pt, DTE[{DTE_MIN}-{DTE_MAX}], ±${STRIKES_RANGE}, "
-        f"minOI={MIN_OI}, maxSpread={int(MAX_SPREAD_PCT*100)}%</code></p>",
-        _html_table(tier1, "Tier 1 (High Conviction)"),
-        _html_table(tier2, "Tier 2 (Moderate)"),
-        _html_table(watch, "Watchlist (Top Fallback)"),
-        "<h4>Debug</h4><pre>" + "\n".join(logs) + "</pre>"
-    ]
-    html_body = "\n".join(html)
-
-    send_email(subject, text_body, html_body=html_body)
-
-    if num:
-        print(f"[{_now()}] ✅ Emailed {num} idea(s). Saved output/trade_ideas_ranked.csv")
+    if isinstance(result, dict):
+        tier1 = result.get("tier1", []) or result.get("t1", []) or []
+        tier2 = result.get("tier2", []) or result.get("t2", []) or []
+        watch = result.get("watchlist", []) or result.get("watch", []) or []
+        dbg = result.get("debug", []) or result.get("notes", [])
+        if isinstance(dbg, list):
+            debug_lines = [str(x) for x in dbg]
+    elif isinstance(result, (list, tuple)) and len(result) >= 3:
+        tier1, tier2, watch = result[0], result[1], result[2]
+        if len(result) >= 4 and isinstance(result[3], dict):
+            stats = result[3]
+            debug_lines = [f"{k}: {v}" for k, v in stats.items()]
     else:
-        print(f"[{_now()}] ⚠️ No Tier1/Tier2 ideas; emailed watchlist/debug.")
+        debug_lines = ["⚠ Unexpected result structure from generate_ranked_ideas"]
+
+    subject, body = _build_email(tier1, tier2, watch, debug_lines)
+
+    # Send mail
+    send_email(
+        subject=subject,
+        body=body,
+        to_addr=os.getenv("TO_EMAIL"),
+        from_addr=os.getenv("EMAIL_ADDRESS"),
+        password=os.getenv("EMAIL_PASSWORD"),
+    )
+
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] ✅ Email sent.")
 
 if __name__ == "__main__":
     run()
