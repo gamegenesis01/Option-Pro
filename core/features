@@ -38,7 +38,7 @@ def _scale_gamma(gamma: float, spot: float) -> float:
 def _theta_penalty_per_day(theta: float, price: float) -> float:
     """
     Positive penalty ~0..1 measuring how painful theta is vs. price.
-    theta is per-day (Yahoo/our BS fallback). If price tiny, cap at 1.
+    theta is per-day. If price tiny, cap at 1.
     """
     p = max(price, 0.05)
     pen = -_nz(theta, 0.0) / p  # negative theta => positive penalty
@@ -53,28 +53,13 @@ def build_features(
     """
     Create the feature dictionary the scorer expects.
 
-    Parameters
-    ----------
-    option_row : dict
-        Raw option data (Yahoo-style fields), plus greeks we filled earlier.
-        Expected keys (best-effort): type, strike, expiration, bid, ask, lastPrice,
-        openInterest, volume, impliedVolatility, delta, gamma, theta, vega.
-    market_ctx : dict
-        Context from our pipeline/forecast:
-          S (spot), gap_pct, mom_1h, mom_3h,
-          regime_open/midday/close (0/1),
-          iv_change_pts (assumed Δσ in vol points),
-          iv_1d_chg_pts, iv_percentile_30d.
-    roi_pct : float
-        Taylor-estimated % return for this contract over the chosen horizon.
-    expected_change : float, optional
-        Taylor-estimated absolute option price change (for logging/diagnostics).
-
-    Returns
-    -------
-    dict of float features.
+    option_row: raw option data (Yahoo-style) incl. greeks if present.
+    market_ctx: context from forecast() and regime detection.
+    roi_pct:    Taylor-estimated % return over the chosen horizon.
+    expected_change: absolute Δ option price (diagnostic).
     """
 
+    # ---- market context ----
     S      = _nz(market_ctx.get("S"), 0.0)
     gap    = _nz(market_ctx.get("gap_pct"), 0.0)
     m1h    = _nz(market_ctx.get("mom_1h"), 0.0)
@@ -86,27 +71,28 @@ def build_features(
     iv1d   = _nz(market_ctx.get("iv_1d_chg_pts"), 0.0)
     ivp30  = _nz(market_ctx.get("iv_percentile_30d"), 0.5)
 
+    # ---- option row ----
     bid  = _nz(option_row.get("bid"), 0.0)
     ask  = _nz(option_row.get("ask"), 0.0)
     last = _nz(option_row.get("lastPrice"), 0.0)
     mid  = _mid_price(bid, ask, last)
     spr  = _spread_pct(bid, ask, mid)
 
-    iv   = _nz(option_row.get("impliedVolatility"), 0.0)  # decimal (e.g., 0.25)
-    delta= _nz(option_row.get("delta"), 0.0)
-    gamma= _nz(option_row.get("gamma"), 0.0)
-    theta= _nz(option_row.get("theta"), 0.0)  # per day
-    vega = _nz(option_row.get("vega"), 0.0)   # per +1 vol point
+    iv    = _nz(option_row.get("impliedVolatility"), 0.0)  # decimal (e.g., 0.25)
+    delta = _nz(option_row.get("delta"), 0.0)
+    gamma = _nz(option_row.get("gamma"), 0.0)
+    theta = _nz(option_row.get("theta"), 0.0)  # per day
+    vega  = _nz(option_row.get("vega"), 0.0)   # per +1 vol point
 
-    oi   = _nz(option_row.get("openInterest"), 0.0)
-    vol  = _nz(option_row.get("volume"), 0.0)
+    oi    = _nz(option_row.get("openInterest"), 0.0)
+    vol   = _nz(option_row.get("volume"), 0.0)
 
-    # Derived/scaled features
+    # ---- derived / scaled features ----
     delta_abs   = abs(delta)
     gamma_s     = _scale_gamma(gamma, S)
     theta_pen   = _theta_penalty_per_day(theta, mid)
-    vega_benef  = (vega * dSigma) / max(mid, 0.05)  # benefit as fraction of price, ~- to +
-    vega_benef  = max(-0.5, min(vega_benef, 0.5))   # clamp for stability
+    vega_benef  = (vega * dSigma) / max(mid, 0.05)  # benefit as fraction of price
+    vega_benef  = max(-0.5, min(vega_benef, 0.5))   # clamp
 
     feat = {
         # core payoff/greeks
@@ -136,7 +122,7 @@ def build_features(
         "iv_percentile_30d": ivp30,
     }
 
-    # Optional diagnostics (not used in scoring but nice for logging)
+    # Optional diagnostics
     if expected_change is not None:
         try:
             feat["exp_change_abs"] = float(expected_change)
