@@ -1,106 +1,167 @@
 # core/forecast.py
-from typing import Literal, Dict, Any
+from __future__ import annotations
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from datetime import datetime, time
+from typing import Dict, Any
 
-BiasMode = Literal["revert", "best", "none"]
+try:
+    import pytz
+    _TZ = pytz.timezone("US/Eastern")
+except Exception:
+    _TZ = None  # fall back if pytz isn't available
 
-def _zscore(series: pd.Series, window: int = 20) -> float:
-    s = series.dropna()
-    if len(s) < window + 1:
-        return 0.0
-    ref = s.tail(window)
-    mu = ref.mean()
-    sd = ref.std(ddof=0)
-    if sd == 0 or np.isnan(sd):
-        return 0.0
-    return float((s.iloc[-1] - mu) / sd)
 
-def get_hourly_df(ticker: str, period: str = "30d") -> pd.DataFrame:
+# ---------------------------
+# helpers
+# ---------------------------
+def _now_et() -> datetime:
+    now = datetime.utcnow()
+    if _TZ:
+        # convert naive UTC -> ET
+        return pytz.utc.localize(now).astimezone(_TZ)
+    return now
+
+
+def _is_between(t: time, a: time, b: time) -> bool:
+    return a <= t <= b
+
+
+def _zscore(px: pd.Series, window: int = 20) -> pd.Series:
     """
-    Pull hourly bars with auto-adjusted prices.
+    Rolling z-score. Also fixes pandas' 'truth value of a Series is ambiguous'
+    by converting the latest std to a scalar for edge checks.
     """
-    df = yf.download(
-        ticker, period=period, interval="1h", auto_adjust=True, progress=False
-    )
+    px = px.dropna()
+    if len(px) < window + 2:
+        return pd.Series(index=px.index, dtype=float)
+
+    mean = px.rolling(window=window).mean()
+    sd = px.rolling(window=window).std()
+
+    # OLD (buggy): if sd == 0 or np.isnan(sd): ...
+    # NEW: cast the latest rolling std to a scalar just for the guard.
+    try:
+        last_sd = float(sd.iloc[-1])
+    except Exception:
+        last_sd = float("nan")
+
+    if last_sd == 0 or np.isnan(last_sd):
+        # Return zeros with same index length to avoid downstream shape issues
+        return pd.Series(0.0, index=px.index, dtype=float)
+
+    return (px - mean) / sd
+
+
+def _hourly_prices(ticker: str, days: int = 15) -> pd.Series:
+    """
+    Hourly adjusted close for the last `days`.
+    """
+    df = yf.download(ticker, period=f"{days}d", interval="1h", auto_adjust=True, progress=False)
+    if df is None or df.empty or "Close" not in df.columns:
+        return pd.Series(dtype=float)
+    return df["Close"].dropna()
+
+
+def _daily_ohlc(ticker: str, days: int = 5) -> pd.DataFrame:
+    df = yf.download(ticker, period=f"{days}d", interval="1d", auto_adjust=True, progress=False)
     if df is None or df.empty:
         return pd.DataFrame()
-    return df.dropna()
+    return df
 
-def forecast_move(
-    ticker: str,
-    horizon_hours: int = 2,
-    lookback_hours: int = 72,
-    bias_mode: BiasMode = "revert",
-) -> Dict[str, Any]:
+
+# ---------------------------
+# main API
+# ---------------------------
+def forecast_move(ticker: str, horizon_hours: int = 2, bias_mode: str = "revert") -> Dict[str, Any]:
     """
-    Estimate ΔS over a short horizon using realized hourly volatility.
-    Returns dict with:
-      S                : last close price
-      sigma_1h         : realized hourly vol (stdev of log returns)
-      dS_mag           : magnitude of move S * sigma_1h * sqrt(H)
-      dS_up, dS_dn     : +/− move scenarios
-      dt_years         : horizon in years
-      zscore_20h       : 20-hour z-score of price
-      bias             : 'up'/'down'/None per bias_mode
-    bias_mode:
-      'revert' : mean-reversion by 20h z-score (z > +1 → down; z < -1 → up)
-      'best'   : caller evaluates both directions, pick better later
-      'none'   : no bias, just magnitude (bias=None)
+    Build a light‑weight 'market context' dict for the ticker that other modules use.
+
+    Returns keys:
+      S, gap_pct, mom_1h, mom_3h,
+      regime_open, regime_midday, regime_close,
+      iv_1d_chg_pts, iv_percentile_30d
     """
-    df = get_hourly_df(ticker)
-    if df.empty:
-        return {
-            "S": None, "sigma_1h": None, "dS_mag": None,
-            "dS_up": None, "dS_dn": None, "dt_years": None,
-            "zscore_20h": None, "bias": None, "ok": False,
-            "reason": "no_data"
-        }
-
-    # Use last N hours to estimate realized vol
-    px = df["Close"].astype(float).dropna()
-    if len(px) < max(lookback_hours, 24):
-        return {"S": float(px.iloc[-1]), "sigma_1h": None, "dS_mag": None,
-                "dS_up": None, "dS_dn": None, "dt_years": horizon_hours / (365.0 * 24.0),
-                "zscore_20h": None, "bias": None, "ok": False, "reason": "insufficient_history"}
-
-    S = float(px.iloc[-1])
-    logret = np.log(px / px.shift(1)).dropna()
-    logret = logret.tail(lookback_hours)
-    sigma_1h = float(np.std(logret, ddof=0))  # hourly vol of log-returns
-
-    # Horizon scaling
-    H = max(1, int(horizon_hours))
-    dS_mag = float(S * sigma_1h * np.sqrt(H))
-    dS_up = +dS_mag
-    dS_dn = -dS_mag
-    dt_years = float(H / (365.0 * 24.0))
-
-    # Bias via mean-reversion on 20h z-score
-    z20 = _zscore(px, window=20)
-    bias = None
-    if bias_mode == "revert":
-        if z20 >= +1.0:
-            bias = "down"
-        elif z20 <= -1.0:
-            bias = "up"
-        else:
-            bias = None
-    elif bias_mode == "best":
-        bias = None  # evaluate both directions downstream
-    else:
-        bias = None
-
-    return {
-        "S": S,
-        "sigma_1h": sigma_1h,
-        "dS_mag": dS_mag,
-        "dS_up": dS_up,
-        "dS_dn": dS_dn,
-        "dt_years": dt_years,
-        "zscore_20h": z20,
-        "bias": bias,
-        "ok": True,
-        "reason": "ok"
+    ctx: Dict[str, Any] = {
+        "S": 0.0,
+        "gap_pct": 0.0,
+        "mom_1h": 0.0,
+        "mom_3h": 0.0,
+        "regime_open": 0.0,
+        "regime_midday": 0.0,
+        "regime_close": 0.0,
+        "iv_1d_chg_pts": 0.0,       # placeholder (per‑underlying IV not broadly available)
+        "iv_percentile_30d": 0.5,   # placeholder
     }
+
+    # ---- Prices (hourly) ----
+    px = _hourly_prices(ticker, days=15)
+    if px.empty or len(px) < 5:
+        return ctx
+
+    # Latest spot
+    try:
+        ctx["S"] = float(px.iloc[-1])
+    except Exception:
+        ctx["S"] = 0.0
+
+    # Hourly log-return vol (diagnostic)
+    try:
+        logret = np.log(px / px.shift(1)).dropna().to_numpy()
+        sigma_1h = float(np.std(logret, ddof=0))
+    except Exception:
+        sigma_1h = 0.0
+    ctx["sigma_1h"] = sigma_1h  # not used directly, but handy for debugging
+
+    # Momentum windows (percent)
+    try:
+        if len(px) >= 2:
+            ctx["mom_1h"] = float((px.iloc[-1] / px.iloc[-2] - 1.0) * 100.0)
+        if len(px) >= 4:
+            ctx["mom_3h"] = float((px.iloc[-1] / px.iloc[-4] - 1.0) * 100.0)
+    except Exception:
+        pass
+
+    # Z-score (not directly used for the score now, but available)
+    z20 = _zscore(px, window=20)
+    if not z20.empty:
+        ctx["zscore_20"] = float(z20.iloc[-1])
+
+    # ---- Gap % (today's open vs. prior close) ----
+    try:
+        ddf = _daily_ohlc(ticker, days=6)
+        if len(ddf) >= 2:
+            today_open = float(ddf["Open"].iloc[-1])
+            prior_close = float(ddf["Close"].iloc[-2])
+            if prior_close > 0:
+                ctx["gap_pct"] = (today_open / prior_close - 1.0) * 100.0
+    except Exception:
+        pass
+
+    # ---- Regime flags based on ET clock ----
+    try:
+        now_et = _now_et().time()
+        if _is_between(now_et, time(9, 30), time(11, 0)):
+            ctx["regime_open"] = 1.0
+        elif _is_between(now_et, time(11, 0), time(15, 30)):
+            ctx["regime_midday"] = 1.0
+        elif _is_between(now_et, time(15, 30), time(16, 0)):
+            ctx["regime_close"] = 1.0
+    except Exception:
+        pass
+
+    # ---- Bias (optional) ----
+    # 'revert' biases against extreme z-score; 'trend' biases with momentum. Kept minimal.
+    ctx["bias_mode"] = bias_mode
+    if bias_mode == "revert" and "zscore_20" in ctx:
+        # Negative value means we expect mean‑reversion; positive supports continuation
+        ctx["bias_value"] = -float(ctx["zscore_20"])
+    elif bias_mode == "trend":
+        ctx["bias_value"] = float(ctx["mom_3h"])
+
+    # IV context placeholders (we don't have aggregate underlying IV from yfinance)
+    ctx["iv_1d_chg_pts"] = 0.0
+    ctx["iv_percentile_30d"] = 0.5
+
+    return ctx
