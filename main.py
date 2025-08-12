@@ -3,7 +3,7 @@ import os
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
-from core.signals import generate_ranked_ideas   # existing module in your repo
+from core.signals import generate_ranked_ideas   # existing in your repo
 from core.emailer import send_email              # existing mailer
 
 # --------- runtime config ---------
@@ -14,7 +14,6 @@ TICKERS = [
 ]
 
 HORIZON_HOURS = int(os.getenv("HORIZON_HOURS", 2))
-BIAS_MODE = os.getenv("BIAS_MODE", "revert")  # or "trend"
 
 # Looser gating settings (match filter_options defaults)
 FILTER_CFG: Dict[str, Any] = {
@@ -89,11 +88,11 @@ def _build_email(
 def run():
     print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] 🚀 Running Option Pro (ranked)…")
 
-    # generate_ranked_ideas return type can be tuple or dict depending on your current signals.py.
+    # NOTE: No 'bias_mode' here — your signals.generate_ranked_ideas()
+    # doesn’t accept it yet. We'll wire that later if needed.
     result = generate_ranked_ideas(
         tickers=TICKERS,
         horizon_hours=HORIZON_HOURS,
-        bias_mode=BIAS_MODE,
         filter_cfg=FILTER_CFG,
     )
 
