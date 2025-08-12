@@ -1,26 +1,29 @@
-import smtplib
-from email.message import EmailMessage
-import os
+# core/emailer.py
+import os, smtplib, ssl
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
-def send_email(subject, body):
-    EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
-    EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-    TO_EMAIL = os.getenv("TO_EMAIL")
+def send_email(subject: str, text_body: str, html_body: str | None = None):
+    from_addr = os.getenv("EMAIL_ADDRESS")
+    password  = os.getenv("EMAIL_PASSWORD")
+    to_addr   = os.getenv("TO_EMAIL")
 
-    if not all([EMAIL_ADDRESS, EMAIL_PASSWORD, TO_EMAIL]):
-        print("❌ Missing environment variables for email.")
+    if not from_addr or not password or not to_addr:
+        print("⚠️ Missing email env vars (EMAIL_ADDRESS / EMAIL_PASSWORD / TO_EMAIL).")
         return
 
-    msg = EmailMessage()
+    msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = EMAIL_ADDRESS
-    msg["To"] = TO_EMAIL
-    msg.set_content(body)
+    msg["From"] = from_addr
+    msg["To"] = to_addr
 
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-            smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            smtp.send_message(msg)
-        print("✅ Email sent successfully.")
-    except Exception as e:
-        print(f"❌ Email failed: {e}")
+    part1 = MIMEText(text_body or "", "plain")
+    msg.attach(part1)
+    if html_body:
+        part2 = MIMEText(html_body, "html")
+        msg.attach(part2)
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+        server.login(from_addr, password)
+        server.sendmail(from_addr, [to_addr], msg.as_string())
