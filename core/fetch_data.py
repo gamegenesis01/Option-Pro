@@ -2,140 +2,104 @@
 
 from __future__ import annotations
 
-import math
+import datetime as _dt
 from typing import Optional
 
-import numpy as np
 import pandas as pd
-import yfinance as yf
+
+try:
+    import yfinance as yf
+except Exception as e:  # pragma: no cover
+    yf = None
 
 
-# --- Public helpers ----------------------------------------------------------
+__all__ = ["get_price_history"]
+
+
+def _to_naive_utc_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure index is tz-naive UTC and sorted."""
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return df
+    idx = df.index
+    if idx.tz is not None:
+        df.index = idx.tz_convert("UTC").tz_localize(None)
+    df = df.sort_index()
+    return df
+
 
 def get_price_history(
     symbol: str,
-    period_days: int = 30,
+    lookback_days: int = 60,
     interval: str = "1h",
-    *,
+    start: Optional[_dt.datetime] = None,
+    end: Optional[_dt.datetime] = None,
     auto_adjust: bool = True,
-    min_bars: int = 40,
-) -> pd.Series:
+    **kwargs,
+) -> pd.DataFrame:
     """
-    Fetch intraday/daily history from Yahoo Finance and return a clean Close series.
+    Fetch OHLCV price history for `symbol`.
 
-    - Normalizes column names (handles multi-index from yfinance for single symbols)
-    - Drops dupes/NaNs, sorts by time, and ensures we have enough bars
-    - Returns a float Series named 'Close' indexed by UTC timestamps (if provided)
+    Accepts `lookback_days` to be compatible with upstream callers.
+    Any extra kwargs are ignored to avoid breaking when callers pass more.
 
-    Raises:
-        ValueError: if no data or insufficient bars are returned.
+    Parameters
+    ----------
+    symbol : str
+        Ticker, e.g., "AAPL".
+    lookback_days : int
+        Number of calendar days to fetch when `start`/`end` not provided.
+    interval : str
+        yfinance interval string, e.g., "1m","5m","15m","1h","1d".
+    start, end : datetime | None
+        Optional explicit range (UTC). If not given, `lookback_days` is used.
+    auto_adjust : bool
+        Adjust OHLC to account for splits/dividends.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ["Open","High","Low","Close","Adj Close","Volume"] (where available).
+        Index: naive UTC DatetimeIndex.
     """
-    if period_days < 1:
-        period_days = 1
-
-    period = f"{period_days}d"
-
-    # Defensive download; yfinance changed defaults a few times, we make them explicit.
-    try:
-        df = yf.download(
-            tickers=symbol,
-            period=period,
-            interval=interval,
-            auto_adjust=auto_adjust,
-            prepost=False,
-            progress=False,
-            threads=True,
+    if yf is None:
+        raise RuntimeError(
+            "yfinance is required but not available. Add 'yfinance' to requirements.txt."
         )
-    except Exception as e:
-        raise ValueError(f"{symbol}: download failed ({e})")
 
-    if df is None or df.empty:
-        raise ValueError(f"{symbol}: no data returned (period={period}, interval={interval})")
+    # Determine time window
+    if start is None or end is None:
+        end = _dt.datetime.utcnow()
+        start = end - _dt.timedelta(days=int(lookback_days))
 
-    # yfinance sometimes returns a column MultiIndex even for a single ticker
-    if isinstance(df.columns, pd.MultiIndex):
-        # Expected shape: top level fields, second level ticker
-        # Pick the first (or matching symbol) second-level column
-        if symbol in df.columns.get_level_values(-1):
-            df = df.xs(symbol, axis=1, level=-1)
-        else:
-            # Fallback to the first column set
-            df = df.droplevel(-1, axis=1)
-
-    # Standardize column capitalization just in case
-    cols = {c: c.capitalize() for c in df.columns}
-    df = df.rename(columns=cols)
-
-    if "Close" not in df.columns:
-        # Sometimes Yahoo returns 'Adj Close' only when auto_adjust=False
-        if "Adj Close" in df.columns:
-            df["Close"] = df["Adj Close"]
-        else:
-            raise ValueError(f"{symbol}: Close column missing in response")
-
-    # Clean up
-    df = (
-        df.sort_index()
-          .loc[~df.index.duplicated(keep="last")]
-          .dropna(subset=["Close"])
+    # yfinance download
+    df = yf.download(
+        tickers=symbol,
+        start=start,
+        end=end,
+        interval=interval,
+        auto_adjust=auto_adjust,
+        progress=False,
+        threads=False,
     )
 
-    px = df["Close"].astype(float)
+    # Some intervals return an empty MultiIndex when no data
+    if isinstance(df, pd.DataFrame) and df.empty:
+        return df
 
-    if px.size < min_bars:
-        raise ValueError(
-            f"{symbol}: insufficient bars ({px.size} < {min_bars}) "
-            f"for period={period}, interval={interval}"
-        )
+    # Normalize
+    if isinstance(df.columns, pd.MultiIndex):
+        # When multiple tickers are passed yfinance creates MultiIndex;
+        # we only requested one symbol, so drop the outer level.
+        df = df.droplevel(0, axis=1)
 
-    return px
+    df = _to_naive_utc_index(df)
 
+    # Ensure expected columns exist (fill if missing)
+    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+        if col not in df.columns:
+            if col == "Adj Close" and "Close" in df.columns:
+                df["Adj Close"] = df["Close"]
+            else:
+                df[col] = pd.NA
 
-def compute_log_returns(px: pd.Series) -> pd.Series:
-    """
-    Log returns from a price series: ln(P_t / P_{t-1})
-    """
-    if px is None or px.empty:
-        raise ValueError("compute_log_returns: empty price series")
-
-    return np.log(px / px.shift(1)).dropna()
-
-
-def pick_interval_for_window(horizon_hours: int) -> str:
-    """
-    Choose a reasonable Yahoo interval based on horizon.
-    """
-    if horizon_hours <= 2:
-        return "30m"   # finer granularity helps short horizons
-    if horizon_hours <= 6:
-        return "1h"
-    if horizon_hours <= 48:
-        return "2h"
-    return "1d"
-
-
-def get_last_price(symbol: str) -> Optional[float]:
-    """
-    Best-effort last trade/close price. Returns None if unavailable.
-    """
-    try:
-        tkr = yf.Ticker(symbol)
-        # Try fast_info first (quick and usually present)
-        fi = getattr(tkr, "fast_info", None)
-        if fi and getattr(fi, "last_price", None) is not None:
-            return float(fi.last_price)
-
-        # Fallback to 1d/1m history
-        h = tkr.history(period="1d", interval="1m", prepost=False)
-        if not h.empty and "Close" in h.columns:
-            return float(h["Close"].iloc[-1])
-
-        # Fallback to last close
-        h = tkr.history(period="2d", interval="1d", prepost=False)
-        if not h.empty and "Close" in h.columns:
-            return float(h["Close"].iloc[-1])
-
-    except Exception:
-        pass
-
-    return None
+    return df
