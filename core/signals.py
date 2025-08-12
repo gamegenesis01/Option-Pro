@@ -1,237 +1,185 @@
-# core/signals.py
 from typing import List, Dict, Any, Tuple
-from datetime import datetime, timezone
+import numpy as np
+import pandas as pd
+from .strategy import CFG
+from .fetch_data import get_price_history
+from .features import add_features, latest_snapshot
+from .forecast import forecast_move
+from .options import get_option_chain_near_money
+from .filter_options import filter_chain_liquidity
+from .scoring import score_signal
 
-from core.forecast import forecast_move              # you already have this
-from core.options import get_atm_options             # you already have this
-from core.greeks import bs_price_greeks              # fallback when greeks missing
-from core.features import build_features             # NEW (from previous step)
-from core.scoring import score_contract              # NEW (from previous step)
-
-# ---------- tiny utils ----------
-def _mid_price(bid: float, ask: float, last_price: float) -> float:
-    try:
-        b = float(bid); a = float(ask)
-        if b > 0 and a > 0:
-            return round((b + a) / 2.0, 4)
-    except Exception:
-        pass
-    try:
-        return round(float(last_price or 0.0), 4)
-    except Exception:
-        return 0.0
-
-def _to_years(expiration_str: str) -> float:
-    try:
-        exp = datetime.fromisoformat(str(expiration_str).split("T")[0]).replace(tzinfo=timezone.utc)
-    except Exception:
-        return 0.0
-    days = (exp - datetime.utcnow().replace(tzinfo=timezone.utc)).days
-    return max(days, 0) / 365.0
-
-def _fill_greeks_if_missing(opt: Dict[str, Any], S: float, r: float = 0.05) -> Dict[str, Any]:
+def _two_of_three_triggers(snap: dict, cfg: dict) -> Tuple[bool, str, Dict[str, Any]]:
     """
-    Use Yahoo greeks if present; otherwise compute via BS using the row IV.
-    Conventions:
-      - theta: per day
-      - vega : per +1 vol point (0.01)
+    Decide direction using 3 signals (need >=2 confluences):
+      1) RSI (<= rsi_buy → CALL, >= rsi_sell → PUT)
+      2) MACD hist sign (>= macd_min → CALL, <= -macd_min → PUT)
+      3) EMA trend sign (fast-slow >= ema_trend_min → CALL, <= -ema_trend_min → PUT)
     """
-    delta = float(opt.get("delta") or 0.0)
-    gamma = float(opt.get("gamma") or 0.0)
-    theta = float(opt.get("theta") or 0.0)
-    vega  = float(opt.get("vega") or 0.0)
+    rsi_buy, rsi_sell = cfg["rsi_buy"], cfg["rsi_sell"]
+    macd_min = cfg["macd_min"]
+    trend_min = cfg["ema_trend_min"]
 
-    iv = float(opt.get("impliedVolatility") or 0.0)  # decimal
-    K  = float(opt.get("strike") or 0.0)
-    T  = _to_years(str(opt.get("expiration", "")))
-    typ= "call" if str(opt.get("type","CALL")).upper() == "CALL" else "put"
+    votes_call = 0
+    votes_put  = 0
+    reasons = []
 
-    # recompute if any key greek looks unusable
-    if (abs(delta) < 0.01 or gamma == 0.0 or theta == 0.0 or vega == 0.0) and (iv > 0 and T > 0 and K > 0):
-        bs = bs_price_greeks(S, K, T, r, iv, typ)
-        delta = bs["delta"]
-        gamma = bs["gamma"]
-        theta = bs["theta_per_day"]
-        vega  = bs["vega_per_1pct"]
+    # RSI vote
+    if snap["rsi"] <= rsi_buy:
+        votes_call += 1
+        reasons.append(f"RSI≤{rsi_buy}")
+    elif snap["rsi"] >= rsi_sell:
+        votes_put += 1
+        reasons.append(f"RSI≥{rsi_sell}")
 
-    opt["delta"] = float(delta)
-    opt["gamma"] = float(gamma)
-    opt["theta"] = float(theta)
-    opt["vega"]  = float(vega)
-    return opt
+    # MACD vote
+    if snap["macd_hist"] >= macd_min:
+        votes_call += 1
+        reasons.append(f"MACD≥{macd_min:.2f}")
+    elif snap["macd_hist"] <= -macd_min:
+        votes_put += 1
+        reasons.append(f"MACD≤{-macd_min:.2f}")
 
-def _taylor_change(opt: Dict[str, Any], dS: float, dSigma_pts: float, days_forward: float) -> float:
-    delta = float(opt.get("delta", 0.0))
-    gamma = float(opt.get("gamma", 0.0))
-    theta = float(opt.get("theta", 0.0))     # per day
-    vega  = float(opt.get("vega", 0.0))      # per +1 vol point
-    return (delta * dS) + (0.5 * gamma * dS * dS) + (theta * days_forward) + (vega * dSigma_pts)
+    # EMA trend vote
+    if snap["ema_trend"] >= trend_min:
+        votes_call += 1
+        reasons.append(f"EMA↑≥{trend_min}")
+    elif snap["ema_trend"] <= -trend_min:
+        votes_put += 1
+        reasons.append(f"EMA↓≤{-trend_min}")
 
-def _detect_regime_utc() -> Tuple[int,int,int]:
-    """
-    Lightweight regime detection using UTC time.
-    US equities open 13:30 UTC (8:30 CT during DST).
-    open:   13:30–15:00 UTC
-    midday: 15:00–19:30 UTC
-    close:  19:30–21:00 UTC
-    Returns three flags: (open, midday, close)
-    """
-    now = datetime.utcnow()
-    hhmm = now.hour * 100 + now.minute
-    open_f   = 1330 <= hhmm < 1500
-    close_f  = 1930 <= hhmm < 2100
-    midday_f = not open_f and not close_f
-    return (1 if open_f else 0, 1 if midday_f else 0, 1 if close_f else 0)
+    direction = None
+    if votes_call >= 2 and votes_call > votes_put:
+        direction = "CALL"
+    elif votes_put >= 2 and votes_put > votes_call:
+        direction = "PUT"
 
-# ---------- main engine ----------
+    return (direction is not None), (direction or "NONE"), {
+        "votes_call": votes_call, "votes_put": votes_put, "reasons": reasons
+    }
+
+def _expected_move_pts(snap: dict, z_abs: float, cfg: dict) -> float:
+    # Blend ATR and zscore to propose a modest expected move
+    atr = max(1e-9, float(snap["atr"]))
+    base = 0.40 * atr + 0.10 * z_abs  # small, realistic for 1–3h
+    return max(cfg["min_exp_move_pts"], round(base, 2))
+
 def generate_ranked_ideas(
     tickers: List[str],
-    horizon_hours: int = 2,
-    iv_change_pts: float = 0.5,
-    min_score_tier1: float = 80.0,
-    min_score_tier2: float = 60.0,
-    dte_min: int = 0,
-    dte_max: int = 14,
-    strikes_range: int = 8,
-    topN_fallback: int = 5,
-    min_oi: int = 100,
-    max_spread_pct: float = 0.35
+    horizon_hours: int = None,
+    cfg: dict = None
 ) -> Dict[str, Any]:
     """
-    Returns a dict:
-      {
-        "tier1": [ideas...], "tier2": [ideas...], "watch": [ideas...],
-        "all": [ideas_sorted...], "logs": ["[SPY] stats: ...", ...]
-      }
-    Each idea has fields: Ticker, Type, Strike, Expiration, Buy Price, Sell Price, ROI, Score, Reasons, etc.
+    Main entry: returns dict with 'tier1', 'tier2', 'watch', 'logs'.
     """
-    days_forward = float(horizon_hours) / 24.0
-    reg_open, reg_mid, reg_close = _detect_regime_utc()
+    cfg = dict(CFG) if cfg is None else cfg
+    horizon_h = horizon_hours or cfg["default_horizon_h"]
 
-    out_all: List[Dict[str, Any]] = []
-    logs: List[str] = []
+    tier1, tier2, watch = [], [], []
+    logs = []
 
     for t in tickers:
-        # 1) forecast underlying move
-        f = forecast_move(t, horizon_hours=horizon_hours, bias_mode="revert")
-        if not f.get("ok"):
-            logs.append(f"[{t}] ⚠️ Forecast issue: {f.get('reason')}")
-            continue
-
-        S      = float(f["S"])
-        dS_up  = float(f["dS_up"])
-        dS_dn  = float(f["dS_dn"])
-        gap    = float(f.get("gap_pct", 0.0))
-        m1h    = float(f.get("mom_1h", 0.0))
-        m3h    = float(f.get("mom_3h", 0.0))
-        iv1d   = float(f.get("iv_1d_chg_pts", 0.0))
-        ivp30  = float(f.get("iv_percentile_30d", 0.5))
-
-        # 2) pull option candidates around ATM
-        chain = get_atm_options(
-            t,
-            max_dte=dte_max,
-            min_dte=dte_min,
-            strikes_range=strikes_range
-        )
-        if not chain:
-            logs.append(f"[{t}] ⚠️ No option data.")
-            continue
-
-        # stats counters
-        stats = {"mid<=0":0, "missing_iv":0, "thin_oi":0, "wide_spread":0, "ok":0}
-
-        for opt in chain:
-            side = str(opt.get("type","CALL")).upper()
-            iv   = float(opt.get("impliedVolatility") or 0.0)
-            if iv <= 0.0:
-                stats["missing_iv"] += 1
+        try:
+            # 1) Data & features
+            df = get_price_history(t, period="30d", interval="60m")  # 1h bars per your request
+            if df is None or df.empty:
+                logs.append((t, "NoData"))
                 continue
 
-            bid = float(opt.get("bid") or 0.0)
-            ask = float(opt.get("ask") or 0.0)
-            last= float(opt.get("lastPrice") or 0.0)
-            mid = _mid_price(bid, ask, last)
-            if mid <= 0:
-                stats["mid<=0"] += 1
+            fdf = add_features(df, ema_fast=cfg["ema_fast"], ema_slow=cfg["ema_slow"])
+            snap = latest_snapshot(fdf)
+
+            # 2) Quick check: confluence decision
+            ok, direction, meta = _two_of_three_triggers(snap, cfg)
+            if not ok:
+                logs.append((t, "NoConfluence"))
                 continue
 
-            # Liquidity guards
-            oi  = int(opt.get("openInterest") or 0)
-            spr = ((ask - bid) / mid) if (mid > 0 and ask > 0 and bid > 0) else 1.0
-            if oi < min_oi:
-                stats["thin_oi"] += 1
+            # 3) Stats-based move (zscore etc.)
+            fc = forecast_move(t, horizon_hours=horizon_h, bias_mode="revert")
+            z_abs = abs(float(fc.get("zscore", 0.0)))
+
+            exp_move = _expected_move_pts(snap, z_abs, cfg)
+
+            # 4) Pull options, keep near-the-money, DTE 0..14
+            chain = get_option_chain_near_money(
+                ticker=t,
+                direction=direction,
+                strike_window=cfg["strike_window"],
+                dte_min=cfg["dte_min"],
+                dte_max=cfg["dte_max"]
+            )
+            if chain.empty:
+                logs.append((t, "NoChain"))
                 continue
-            if spr >= max_spread_pct:
-                stats["wide_spread"] += 1
+
+            chain = filter_chain_liquidity(
+                chain,
+                max_spread_pct=cfg["max_spread_pct"],
+                min_open_interest=cfg["min_open_interest"]
+            )
+            if chain.empty:
+                logs.append((t, "Illiquid"))
                 continue
 
-            # Fill greeks if Yahoo gave zeros
-            opt = _fill_greeks_if_missing(opt, S=S, r=0.05)
+            # 5) Score & choose best contract
+            score = score_signal(snap, z_abs, cfg, direction)
+            best = chain.sort_values("spread_pct").iloc[0].to_dict()
 
-            # 3) compute Taylor ΔOption and ROI
-            dS = dS_up if side == "CALL" else dS_dn
-            dOpt = _taylor_change(opt, dS=dS, dSigma_pts=iv_change_pts, days_forward=days_forward)
-            if dOpt <= 0:
-                continue
-
-            roi_pct = 100.0 * (dOpt / mid)
-
-            # 4) build features & score
-            market_ctx = {
-                "S": S,
-                "gap_pct": gap,
-                "mom_1h": m1h,
-                "mom_3h": m3h,
-                "regime_open": reg_open,
-                "regime_midday": reg_mid,
-                "regime_close": reg_close,
-                "iv_change_pts": iv_change_pts,
-                "iv_1d_chg_pts": iv1d,
-                "iv_percentile_30d": ivp30,
+            idea = {
+                "ticker": t,
+                "direction": direction,
+                "reason": ", ".join(meta["reasons"]),
+                "score": round(score, 3),
+                "price": round(snap["close"], 2),
+                "exp_move_pts": exp_move,
+                "contract": {
+                    "symbol": best.get("contractSymbol"),
+                    "dte": int(best.get("dte", 0)),
+                    "strike": float(best.get("strike", 0.0)),
+                    "mark": round(float(best.get("mark", 0.0)), 2),
+                    "spread_pct": round(float(best.get("spread_pct", 0.0)), 2),
+                    "oi": int(best.get("openInterest", 0)),
+                },
+                "debug": {
+                    "rsi": round(snap["rsi"], 2),
+                    "macd_hist": round(snap["macd_hist"], 4),
+                    "ema_trend": round(snap["ema_trend"], 4),
+                    "zscore": round(z_abs, 2),
+                }
             }
-            feat = build_features(option_row=opt, market_ctx=market_ctx, roi_pct=roi_pct, expected_change=dOpt)
-            score, reasons = score_contract(feat)
 
-            stats["ok"] += 1
+            if score >= cfg["tier1_min"]:
+                tier1.append(idea)
+            elif score >= cfg["tier2_min"]:
+                tier2.append(idea)
+            else:
+                watch.append(idea)
 
-            out_all.append({
-                "Ticker": t,
-                "Type": "Call" if side == "CALL" else "Put",
-                "Strike": float(opt.get("strike")),
-                "Expiration": str(opt.get("expiration")),
-                "Spot": S,
-                "Buy Price": round(mid, 4),
-                "Sell Price": round(mid + dOpt, 4),
-                "Expected Change": round(dOpt, 4),
-                "ROI": round(roi_pct, 2),
-                "Score": round(score, 1),
-                "Reasons": reasons,
-                "DTE": int(opt.get("DTE", 0)),
-                "IV": round(iv, 4),
-                "Delta": round(float(opt.get("delta", 0.0)), 4),
-                "Gamma": round(float(opt.get("gamma", 0.0)), 4),
-                "Theta": round(float(opt.get("theta", 0.0)), 4),
-                "Vega":  round(float(opt.get("vega", 0.0)), 4),
-            })
+            logs.append((t, "OK"))
 
-        logs.append(f"[{t}] stats: " + ", ".join(f"{k}={v}" for k,v in stats.items()))
+        except Exception as e:
+            logs.append((t, f"ERR:{e}"))
 
-    # 5) rank & tier
-    out_all.sort(key=lambda x: x["Score"], reverse=True)
-
-    tier1 = [x for x in out_all if x["Score"] >= min_score_tier1]
-    tier2 = [x for x in out_all if min_score_tier2 <= x["Score"] < min_score_tier1]
-    watch = [x for x in out_all if x["Score"] < min_score_tier2][:max(0, topN_fallback - len(tier1) - len(tier2))]
-
-    # fallback: if nothing in tier1/tier2, send topN anyway
-    if not tier1 and not tier2 and out_all:
-        watch = out_all[:topN_fallback]
+    # Rank inside buckets by score desc, then smallest spread
+    def _sort(bucket):
+        return sorted(bucket, key=lambda x: (-x["score"], x["contract"]["spread_pct"]))
 
     return {
-        "tier1": tier1,
-        "tier2": tier2,
-        "watch": watch,
-        "all": out_all,
-        "logs": logs
+        "tier1": _sort(tier1),
+        "tier2": _sort(tier2),
+        "watch": _sort(watch),
+        "logs": logs,
+        "meta": {
+            "horizon_h": horizon_h,
+            "cfg": {
+                "rsi": (cfg["rsi_buy"], cfg["rsi_sell"]),
+                "macd_min": cfg["macd_min"],
+                "ema_fast": cfg["ema_fast"],
+                "ema_slow": cfg["ema_slow"],
+                "max_spread_pct": cfg["max_spread_pct"],
+                "min_open_interest": cfg["min_open_interest"],
+                "dte": (cfg["dte_min"], cfg["dte_max"]),
+            }
+        }
     }
