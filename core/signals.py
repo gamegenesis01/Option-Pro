@@ -1,258 +1,261 @@
 # core/signals.py
 from __future__ import annotations
 
-import math
-import datetime as dt
+from dataclasses import dataclass
 from typing import Dict, List, Tuple, Any
 
+import math
 import numpy as np
 import pandas as pd
 
-# Local modules (all already in your repo)
-from .fetch_data import get_price_history  # price history (yfinance)
-from .forecast import forecast_move        # produces exp_dS and exp_dIV estimate
-from .options import get_option_chain_near_money  # pulls a near-money chain
-from .filter_options import filter_contracts      # liquidity/quality filters
+# Project imports
+from core.fetch_data import get_price_history             # price history (1h bars)
+from core.features import add_features, latest_snapshot   # builds exp_dS, exp_dIV
+from core.options import get_option_chain_near_money      # pulls near-the-money OC
+from core.filter_options import filter_contracts          # <- you'll implement/edit
+from core.scoring import score_contracts                  # ranks contracts
 
 
-TRADING_HOURS_PER_DAY = 6.5
+@dataclass
+class Idea:
+    symbol: str
+    expiry: str
+    type: str
+    strike: float
+    mid: float
+    bid: float
+    ask: float
+    iv: float
+    delta: float
+    gamma: float
+    theta_day: float
+    vega: float
+    rho: float
+    exp_dS: float
+    exp_dIV_pts: float
+    horizon_h: int
+    exp_change: float
+    exp_roi: float
 
-DEFAULT_UNIVERSE = [
-    "SPY", "AAPL", "TSLA", "MSFT", "AMZN",
-    "GOOGL", "NVDA", "META", "NFLX",
-    "AMD", "AAL", "PLTR", "F", "RIVN", "SOFI",
-]
 
-# -------------------------------
-# Helpers
-# -------------------------------
-
-def _theta_over_hours(theta_day: float, horizon_hours: float) -> float:
-    """Convert daily theta to the horizon contribution (≈ only during RTH)."""
-    if TRADING_HOURS_PER_DAY <= 0:
-        return 0.0
-    frac = horizon_hours / TRADING_HOURS_PER_DAY
-    return theta_day * frac
-
-
-def _expected_change_from_greeks(
-    contract: Dict[str, Any],
-    exp_dS: float,
-    exp_dIV_pts: float,
-    horizon_hours: float,
-) -> float:
+def _expect_pnl_from_greeks(
+    *,
+    mid: float,
+    delta: float,
+    gamma: float,
+    theta_day: float,
+    vega: float,
+    rho: float,
+    dS: float,
+    dIV_pts: float,
+    horizon_h: int,
+    dr: float = 0.0,
+) -> Tuple[float, float]:
     """
-    Taylor expansion on the option P/L given the contract greeks and forecast.
-    exp_dIV_pts is in 'percentage points' (e.g., +0.5 means +0.5 vol points).
+    Taylor expansion around current point.
+    Returns (exp_change_in_premium, exp_roi_percent).
     """
-    delta = float(contract.get("delta", 0.0))
-    gamma = float(contract.get("gamma", 0.0))
-    theta_day = float(contract.get("theta_day", 0.0))
-    vega = float(contract.get("vega", 0.0))
-    rho = float(contract.get("rho", 0.0))  # we keep rho * 0 unless you feed a view
+    if mid <= 0 or any(map(lambda x: np.isnan(x) or np.isinf(x),
+                           [mid, delta, gamma, theta_day, vega, rho, dS, dIV_pts])):
+        return 0.0, 0.0
 
-    dS = float(exp_dS)
-    dIV = float(exp_dIV_pts) / 100.0  # convert pts → decimal
-    dt_hours = float(horizon_hours)
+    dIV = float(dIV_pts) / 100.0
+    dt_days = horizon_h / 24.0
 
-    # First and second order price move
-    first_order = delta * dS
-    second_order = 0.5 * gamma * (dS ** 2)
+    exp_change = (
+        delta * dS +
+        0.5 * gamma * (dS ** 2) +
+        theta_day * dt_days +
+        vega * dIV +
+        rho * dr * dt_days
+    )
 
-    # Time decay over the intraday horizon
-    theta_contrib = _theta_over_hours(theta_day, dt_hours)
-
-    # Vol contribution
-    vega_contrib = vega * dIV
-
-    # No explicit rate view intraday
-    rho_contrib = 0.0 * rho
-
-    return first_order + second_order + theta_contrib + vega_contrib + rho_contrib
+    exp_roi = 100.0 * (exp_change / mid) if mid > 0 else 0.0
+    return float(exp_change), float(exp_roi)
 
 
-def _roi_pct(exp_change: float, mid: float) -> float:
-    if mid is None or mid <= 0:
-        return -np.inf
-    return 100.0 * (exp_change / float(mid))
-
-
-def _tier_from_roi(roi_pct_value: float) -> str | None:
+def _default_filter_cfg() -> Dict[str, Any]:
     """
-    Tiering logic:
-    - Tier 1: ROI ≥ 40%
-    - Tier 2: 20% ≤ ROI < 40%
-    - None: below 20%
+    Reasonable defaults; override in main() via kwargs.
+    You can tighten/loosen these in your own filter_options.py implementation.
     """
-    if roi_pct_value >= 40.0:
-        return "tier1"
-    if roi_pct_value >= 20.0:
-        return "tier2"
-    return None
-
-
-# -------------------------------
-# Main entry
-# -------------------------------
-
-def generate_ranked_ideas(
-    universe: List[str] = None,
-    horizon_hours: float = 2.0,
-    dte_min: int = 0,
-    dte_max: int = 14,
-    min_open_interest: int = 100,
-    max_spread_pct: float = 0.35,
-    price_band_usd: float = 8.0,
-    exp_dIV_pts: float = 0.5,   # +0.5 IV pts as a mild default intraday
-    use_reversion_bias: bool = True,
-) -> Dict[str, Any]:
-    """
-    Pulls data for each symbol, forecasts an expected underlying move (and IV change),
-    evaluates near‑money liquid contracts via Greeks, and ranks them.
-    Returns a dict with 'tier1', 'tier2', 'watch', 'all', 'logs'.
-    """
-    if universe is None:
-        universe = DEFAULT_UNIVERSE
-
-    now_ts = dt.datetime.utcnow()
-
-    tier1: List[Dict[str, Any]] = []
-    tier2: List[Dict[str, Any]] = []
-    watch: List[Dict[str, Any]] = []
-    all_list: List[Dict[str, Any]] = []
-    logs: List[str] = []
-
-    for symbol in universe:
-        # 1) Price history
-        try:
-            px = get_price_history(symbol, lookback_days=30, interval="1h")
-            if px is None or len(px) < 30:
-                logs.append(f"- [{symbol}] ⚠ Forecast issue: bad_returns")
-                continue
-        except Exception as e:
-            logs.append(f"- [{symbol}] ⚠ fetch error: {e}")
-            continue
-
-        # 2) Forecast expected move (and optional IV view)
-        try:
-            fc = forecast_move(
-                symbol,
-                horizon_hours=horizon_hours,
-                bias_mode=("revert" if use_reversion_bias else "none"),
-            )
-            exp_dS = float(fc.get("exp_dS", 0.0))
-            # allow override of IV view via arg; if fc provides one, prefer it unless zero
-            exp_dIV_pts_eff = exp_dIV_pts
-            fc_iv = float(fc.get("exp_dIV_pts", 0.0))
-            if abs(fc_iv) > 1e-9:
-                exp_dIV_pts_eff = fc_iv
-        except Exception as e:
-            logs.append(f"- [{symbol}] ⚠ forecast error: {e}")
-            continue
-
-        # 3) Pull near-money options
-        try:
-            chain = get_option_chain_near_money(
-                symbol,
-                dte_range=(dte_min, dte_max),
-                width=5  # a handful of strikes each side
-            )
-            if chain is None or len(chain) == 0:
-                logs.append(f"- [{symbol}] ⚠ no option chain")
-                continue
-        except Exception as e:
-            logs.append(f"- [{symbol}] ⚠ chain error: {e}")
-            continue
-
-        # 4) Liquidity/quality filters
-        try:
-            filt = filter_contracts(
-                chain,
-                min_oi=min_open_interest,
-                max_spread_pct=max_spread_pct,
-                max_mid=price_band_usd
-            )
-            if filt is None or len(filt) == 0:
-                logs.append(f"- [{symbol}] ⚠ No liquid near-money contracts after filters.")
-                continue
-        except Exception as e:
-            logs.append(f"- [{symbol}] ⚠ filter error: {e}")
-            continue
-
-        # 5) Expected change & ROI per contract
-        ranked_bucket: List[Tuple[float, Dict[str, Any]]] = []
-        for c in filt:
-            try:
-                mid = float(c.get("mid", 0.0))
-                if not (mid > 0):
-                    continue
-
-                exp_chg = _expected_change_from_greeks(
-                    contract=c,
-                    exp_dS=exp_dS if c.get("type") == "call" else -exp_dS if c.get("type") == "put" else exp_dS,
-                    exp_dIV_pts=exp_dIV_pts_eff,
-                    horizon_hours=horizon_hours
-                )
-                roi = _roi_pct(exp_chg, mid)
-
-                out = dict(c)
-                out.update({
-                    "symbol": symbol,
-                    "exp_dS": (exp_dS if c.get("type") == "call" else -exp_dS if c.get("type") == "put" else exp_dS),
-                    "exp_dIV_pts": exp_dIV_pts_eff,
-                    "horizon_h": horizon_hours,
-                    "exp_change": round(exp_chg, 2),
-                    "exp_roi": round(roi, 2),
-                })
-                ranked_bucket.append((roi, out))
-            except Exception as e:
-                logs.append(f"- [{symbol}] ⚠ calc error: {e}")
-                continue
-
-        if not ranked_bucket:
-            # nothing scored, move on
-            continue
-
-        ranked_bucket.sort(reverse=True, key=lambda x: x[0])
-        for _, item in ranked_bucket:
-            all_list.append(item)
-            tier = _tier_from_roi(item["exp_roi"])
-            if tier == "tier1":
-                tier1.append(item)
-            elif tier == "tier2":
-                tier2.append(item)
-            else:
-                # best of the rest = watch (limit size to keep email readable)
-                if len(watch) < 20:
-                    watch.append(item)
-
-        # For visibility: if forecast stage was ok but returns looked odd earlier
-        logs.append(f"- [{symbol}] ⚠ Forecast issue: None")
-
-    # Sort final groups by ROI descending for nice emails
-    tier1.sort(key=lambda d: d.get("exp_roi", -1e9), reverse=True)
-    tier2.sort(key=lambda d: d.get("exp_roi", -1e9), reverse=True)
-    watch.sort(key=lambda d: d.get("exp_roi", -1e9), reverse=True)
-    all_list.sort(key=lambda d: d.get("exp_roi", -1e9), reverse=True)
-
     return {
-        "timestamp": now_ts,
-        "tier1": tier1,
-        "tier2": tier2,
-        "watch": watch,
-        "all": all_list,
-        "logs": logs,
-        # echo key params so the email header shows them
-        "config": {
-            "horizon_hours": horizon_hours,
-            "dte": [dte_min, dte_max],
-            "minOI": min_open_interest,
-            "maxSpread": max_spread_pct,
-            "priceBand": price_band_usd,
-            "exp_dIV_pts": exp_dIV_pts,
-            "bias": "revert" if use_reversion_bias else "none",
-        },
+        "max_spread_pct": 35.0,
+        "min_open_interest": 100,
+        "max_abs_delta": 0.92,       # avoid deep ITM
+        "min_price": 0.15,           # avoid sub-dime junk
+        "max_price": 25.0,           # avoid super expensive
+        "dte_min": 0,
+        "dte_max": 14,
     }
 
 
-__all__ = ["generate_ranked_ideas"]
+def _short_issue(tag: str) -> str:
+    return tag
+
+
+def generate_ranked_ideas(
+    symbols: List[str],
+    *,
+    horizon_hours: int = 2,
+    exp_iv_bps: int = 50,            # +50 bps = +0.5 IV point default
+    min_roi_pct: float = 18.0,       # floor for Tiering
+    filter_cfg: Dict[str, Any] | None = None,
+    max_per_tier: int = 10,
+    debug: bool = True,
+) -> Dict[str, Any]:
+    """
+    Main entry: builds ranked ideas across a symbol list.
+    Returns dict with keys: tier1, tier2, watch, all, logs
+    """
+    filter_cfg = dict(_default_filter_cfg(), **(filter_cfg or {}))
+    logs: List[str] = []
+    all_candidates: List[Idea] = []
+
+    for sym in symbols:
+        try:
+            # 1) price history + features
+            px = get_price_history(sym, days=30, interval="1h")
+            if px is None or len(px) < 40 or "Close" not in px:
+                logs.append(f"[{sym}] ⚠ Forecast issue: {_short_issue('bad_returns')}")
+                continue
+
+            px = add_features(px)
+            snap = latest_snapshot(px, horizon_hours=horizon_hours)
+            if snap is None or "exp_dS" not in snap or "exp_dIV_pts" not in snap:
+                logs.append(f"[{sym}] ⚠ Forecast issue: {_short_issue('no_snapshot')}")
+                continue
+
+            exp_dS = float(snap["exp_dS"])
+            exp_dIV_pts = float(snap["exp_dIV_pts"])
+
+            # 2) option chain
+            chain_df = get_option_chain_near_money(sym)
+            if chain_df is None or chain_df.empty:
+                logs.append(f"[{sym}] ⚠ No option chain")
+                continue
+
+            # 3) apply liquidity/quality filters (you’ll maintain the internals)
+            filtered = filter_contracts(chain_df, filter_cfg)
+
+            if filtered is None or len(filtered) == 0:
+                logs.append(f"[{sym}] ⚠ No liquid near-money contracts after filters.")
+                continue
+
+            # 4) compute expected PnL + ROI from Greeks
+            ideas_sym: List[Idea] = []
+            for row in filtered:
+                try:
+                    mid = float(row.get("mid", np.nan))
+                    bid = float(row.get("bid", np.nan))
+                    ask = float(row.get("ask", np.nan))
+                    iv = float(row.get("iv", np.nan))
+
+                    delta = float(row.get("delta", np.nan))
+                    gamma = float(row.get("gamma", np.nan))
+                    theta_day = float(row.get("theta_day", np.nan))
+                    vega = float(row.get("vega", np.nan))
+                    rho = float(row.get("rho", 0.0))
+
+                    exp_change, exp_roi = _expect_pnl_from_greeks(
+                        mid=mid, delta=delta, gamma=gamma,
+                        theta_day=theta_day, vega=vega, rho=rho,
+                        dS=exp_dS, dIV_pts=exp_iv_bps / 100.0 * 100,  # preserve pts
+                        horizon_h=horizon_hours, dr=0.0,
+                    )
+
+                    idea = Idea(
+                        symbol=sym,
+                        expiry=str(row.get("expiry")),
+                        type=str(row.get("type")),
+                        strike=float(row.get("strike")),
+                        mid=mid,
+                        bid=bid,
+                        ask=ask,
+                        iv=iv,
+                        delta=delta,
+                        gamma=gamma,
+                        theta_day=theta_day,
+                        vega=vega,
+                        rho=rho,
+                        exp_dS=exp_dS,
+                        exp_dIV_pts=float(exp_iv_bps) / 100.0,  # pts
+                        horizon_h=horizon_hours,
+                        exp_change=exp_change,
+                        exp_roi=exp_roi,
+                    )
+                    ideas_sym.append(idea)
+                except Exception:
+                    # Skip bad rows quietly; keep going
+                    continue
+
+            if not ideas_sym:
+                logs.append(f"[{sym}] ⚠ No candidates post-PnL calc.")
+                continue
+
+            # 5) score & order within symbol (uses your scoring.py)
+            ideas_sym_sorted = score_contracts(ideas_sym)
+
+            # collect to global list
+            all_candidates.extend(ideas_sym_sorted)
+
+            logs.append(f"[{sym}] ⚠ Forecast issue: None")
+        except Exception as e:
+            logs.append(f"[{sym}] ⚠ Unhandled: {e}")
+
+    if not all_candidates:
+        return {
+            "tier1": [],
+            "tier2": [],
+            "watch": [],
+            "all": [],
+            "logs": logs,
+        }
+
+    # Global ordering by expected ROI (desc), with your scoring already applied
+    all_candidates.sort(key=lambda x: (x.exp_roi, -abs(x.delta)), reverse=True)
+
+    # Tiering
+    tier1 = [asdict(i) for i in all_candidates if i.exp_roi >= max(30.0, min_roi_pct)][:max_per_tier]
+    tier2 = [asdict(i) for i in all_candidates if 18.0 <= i.exp_roi < max(30.0, min_roi_pct)][:max_per_tier]
+
+    # Watchlist: best remaining (top fallback)
+    remaining = [i for i in all_candidates if asdict(i) not in tier1 + tier2]
+    watch = [asdict(i) for i in remaining[:max_per_tier]]
+
+    # “all” flattened (cap to keep emails sane)
+    all_dump = [asdict(i) for i in all_candidates[:100]]
+
+    if debug:
+        print(f"[DEBUG] ideas -> tier1:{len(tier1)} | tier2:{len(tier2)} | watch:{len(watch)} | all:{len(all_dump)}")
+
+    return {
+        "tier1": tier1,
+        "tier2": tier2,
+        "watch": watch,
+        "all": all_dump,
+        "logs": logs,
+    }
+
+
+def asdict(i: Idea) -> Dict[str, Any]:
+    return {
+        "symbol": i.symbol,
+        "expiry": i.expiry,
+        "type": i.type,
+        "strike": i.strike,
+        "mid": i.mid,
+        "bid": i.bid,
+        "ask": i.ask,
+        "iv": i.iv,
+        "delta": i.delta,
+        "gamma": i.gamma,
+        "theta_day": i.theta_day,
+        "vega": i.vega,
+        "rho": i.rho,
+        "exp_dS": i.exp_dS,
+        "exp_dIV_pts": i.exp_dIV_pts,
+        "horizon_h": i.horizon_h,
+        "exp_change": i.exp_change,
+        "exp_roi": i.exp_roi,
+    }
