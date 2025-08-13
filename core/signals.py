@@ -3,193 +3,217 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 
-# Local deps
 from core.fetch_data import get_price_history
-from core.options import get_option_chain_near_money
-from core.filter_options import filter_contracts
-from core.scoring import score_contracts
 
 
-# ---- constants / reasons ----------------------------------------------------
+# ---------- utils
 
-REASON_BAD_RETURNS = "bad_returns"
-REASON_BAD_SNAPSHOT = "bad_snapshot"
-
-
-# ---- helpers ----------------------------------------------------------------
-
-def _make_issue(symbol: str, reason: str, note: str = "") -> str:
-    suffix = f" ({note})" if note else ""
-    return f"- [{symbol}] ⚠ Forecast issue: {reason}{suffix}"
-
-
-def _to_lower_cols(df: pd.DataFrame) -> pd.DataFrame:
-    try:
-        df.columns = [str(c).strip().lower() for c in df.columns]
-    except Exception:
-        pass
-    return df
-
-
-def _normalize_price_cols(df: pd.DataFrame) -> pd.DataFrame:
+def _clean_close_series(px: pd.DataFrame) -> pd.Series:
     """
-    Make sure a usable 'close' column exists and is numeric.
-    Accept common variants like Close, Adj Close, c, price, etc.
+    Ensure we return a numeric, 1-D close Series with NaNs dropped.
+    Raises ValueError if unusable.
     """
-    if df is None or len(df) == 0:
-        return df
+    if px is None or not isinstance(px, pd.DataFrame) or px.empty:
+        raise ValueError("empty_frame")
 
-    df = _to_lower_cols(df).copy()
+    # Accept several common column spellings
+    for c in ("close", "Close", "adj_close", "Adj Close"):
+        if c in px.columns:
+            s = pd.to_numeric(px[c], errors="coerce").dropna()
+            if s.empty:
+                raise ValueError("no_valid_close")
+            return s
 
-    # Map common variants to 'close'
-    candidates = ["close", "adj_close", "adjclose", "c", "price", "last", "settle"]
-    existing = [c for c in candidates if c in df.columns]
-
-    if not existing:
-        # If we have OHLC named with capitals, try them (after lowercase this is covered)
-        # nothing to do here; will be caught later
-        return df
-
-    # If 'close' not present, create it from the first viable candidate
-    if "close" not in df.columns:
-        df["close"] = df[existing[0]]
-
-    # Ensure numeric
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
-
-    return df
+    raise ValueError("no_close_column")
 
 
-def _latest_valid_close(df: pd.DataFrame) -> Tuple[float | None, pd.DataFrame]:
-    """
-    Returns the most recent non-NaN close and the trimmed df
-    (rows up to and including that bar). If nothing valid, returns (None, df).
-    """
-    if df is None or df.empty:
-        return None, df
-
-    df = _normalize_price_cols(df)
-
-    if "close" not in df.columns:
-        return None, df
-
-    # Drop NaN closes and keep the last valid bar
-    valid = df.dropna(subset=["close"])
-    if valid.empty:
-        return None, df
-
-    last_close = valid["close"].iloc[-1]
-    return float(last_close), valid
+def _rsi(series: pd.Series, period: int = 14) -> float:
+    """Simple RSI implementation that works on a 1‑D Series."""
+    if len(series) < period + 1:
+        return float("nan")
+    delta = series.diff()
+    up = delta.clip(lower=0.0)
+    down = -delta.clip(upper=0.0)
+    # Wilder's smoothing
+    roll_up = up.ewm(alpha=1 / period, adjust=False).mean()
+    roll_down = down.ewm(alpha=1 / period, adjust=False).mean()
+    rs = roll_up / roll_down.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return float(rsi.iloc[-1])
 
 
-# ---- public API -------------------------------------------------------------
+def _momentum(series: pd.Series, lookback: int) -> float:
+    """Percent change over lookback bars."""
+    if len(series) <= lookback:
+        return float("nan")
+    old = float(series.iloc[-lookback])
+    new = float(series.iloc[-1])
+    if not math.isfinite(old) or old == 0:
+        return float("nan")
+    return (new - old) / old
+
+
+def _vol(series: pd.Series, win: int = 20) -> float:
+    """Simple realized volatility proxy (std of returns)."""
+    if len(series) < win + 1:
+        return float("nan")
+    rets = series.pct_change().dropna()
+    if rets.empty:
+        return float("nan")
+    return float(rets.rolling(win).std().iloc[-1])
+
+
+# ---------- ranking logic (simple placeholder signals)
 
 @dataclass
-class RankedResult:
-    tier1: List[Dict[str, Any]]
-    tier2: List[Dict[str, Any]]
-    watch: List[Dict[str, Any]]
-    all: List[Dict[str, Any]]
-    logs: List[str]
+class SignalSnapshot:
+    symbol: str
+    last: float
+    rsi: float
+    m1h: float
+    vol20: float
+    score: float
+    note: str = ""
 
 
-def generate_ranked_ideas(config: Dict[str, Any]) -> Dict[str, Any]:
+def _score_snapshot(s: SignalSnapshot) -> float:
     """
-    Main orchestrator used by main.py.
+    Combine signals into a single score.
+    Tuned to be stable and monotonic; adjust as you like.
+    """
+    score = 0.0
 
-    Expected config keys:
-      - tickers: list[str]
-      - horizon_hours: int
-      - px_interval: str (e.g., '5m','15m','1h','1d')
-      - filter_cfg: dict (liquidity/quality filters for contracts)
+    # Momentum helps; volatility penalizes; RSI mean-revert if extreme
+    if math.isfinite(s.m1h):
+        score += 100 * s.m1h  # scale momentum
+    if math.isfinite(s.vol20):
+        score -= 10 * s.vol20  # penalize choppy names
+
+    if math.isfinite(s.rsi):
+        # Mild premium if RSI is mid (not overbought/oversold),
+        # discount if very high/low (potential fade)
+        score -= max(0.0, s.rsi - 70) * 0.5
+        score -= max(0.0, 30 - s.rsi) * 0.5
+
+    return float(score)
+
+
+# ---------- public API
+
+def generate_ranked_ideas(config: Dict) -> Dict[str, List[Dict]]:
+    """
+    Build ranked idea buckets.
+
+    config keys expected (keep loose on purpose):
+      - tickers: List[str]
+      - horizon_hours: int  (used only to size the pull; not critical)
+      - px_interval: str    (e.g., '5m', '15m', '1h' — passed through)
+      - min_bars: int       (safety; default 100)
+    Returns:
+      { "tier1": [...], "tier2": [...], "watch": [...], "logs": [...] }
     """
     tickers: List[str] = config.get("tickers", [])
-    horizon_hours: int = int(config.get("horizon_hours", 2))
-    px_interval: str = str(config.get("px_interval", "1h"))
-    filter_cfg: Dict[str, Any] = config.get("filter_cfg", {}) or {}
+    px_interval: str = config.get("px_interval", "5m")
+    horizon_hours: int = int(config.get("horizon_hours", 6))
+    min_bars: int = int(config.get("min_bars", 100))
 
+    # Pull a few extra hours to make sure we have enough bars
+    pull_hours = max(horizon_hours, 6) + 24
+
+    tier1: List[Dict] = []
+    tier2: List[Dict] = []
+    watch: List[Dict] = []
     logs: List[str] = []
-    all_ranked: List[Dict[str, Any]] = []
+
+    snapshots: List[SignalSnapshot] = []
 
     for symbol in tickers:
         try:
-            # --- price history
-            # NOTE: do NOT pass lookback_days unless your fetcher supports it.
-            px = get_price_history(symbol, interval=px_interval)
+            # Fetch prices
+            px = get_price_history(symbol, interval=px_interval, hours=pull_hours)
 
-            last_close, px_valid = _latest_valid_close(px)
-            if (last_close is None) or (isinstance(last_close, float) and (math.isnan(last_close) or math.isinf(last_close))):
-                logs.append(_make_issue(symbol, REASON_BAD_SNAPSHOT, "invalid last close"))
+            # Always reduce to a 1-D close series
+            closes = _clean_close_series(px)
+
+            if len(closes) < min_bars:
+                logs.append(f"- [{symbol}] ⚠ Forecast issue: too_few_bars ({len(closes)})")
                 continue
 
-            # Basic sanity on returns (avoid single-point or all-zeros series)
-            # We only need a few points to proceed
-            if px_valid is None or len(px_valid) < 3:
-                logs.append(_make_issue(symbol, REASON_BAD_RETURNS))
+            # Make sure latest price is finite
+            last = float(closes.iloc[-1])
+            if not math.isfinite(last):
+                logs.append(f"- [{symbol}] ⚠ Forecast issue: bad_snapshot (invalid last close)")
                 continue
 
-            # --- option chain (near-money)
-            chain = get_option_chain_near_money(symbol)
-            if not chain:
-                logs.append(f"- [{symbol}] ⚠ No option chain data")
-                continue
+            # Features computed off the 1‑D close series only
+            # map 1h momentum to bars depending on interval
+            interval_to_minutes = {
+                "1m": 1, "2m": 2, "5m": 5, "10m": 10, "15m": 15, "30m": 30,
+                "60m": 60, "1h": 60
+            }
+            minutes = interval_to_minutes.get(px_interval, 5)
+            lookback_bars_1h = max(1, 60 // max(1, minutes))  # e.g., 12 bars for 5m
 
-            # --- filter for quality/liquidity
-            filt = filter_contracts(chain, filter_cfg)
-            if not filt:
-                logs.append(f"- [{symbol}] ⚠ No liquid near-money contracts after filters.")
-                continue
+            rsi = _rsi(closes, period=14)
+            m1h = _momentum(closes, lookback_bars_1h)
+            vol20 = _vol(closes, win=20)
 
-            # --- score contracts (your scoring module defines how tiers are decided)
-            scored = score_contracts(
+            snap = SignalSnapshot(
                 symbol=symbol,
-                last_price=last_close,
-                contracts=filt,
-                horizon_hours=horizon_hours,
-                price_series=px_valid,   # give the cleaned series for vol/returns if scorer uses it
+                last=last,
+                rsi=rsi,
+                m1h=m1h,
+                vol20=vol20,
+                score=0.0,
             )
+            snap.score = _score_snapshot(snap)
+            snapshots.append(snap)
 
-            # `score_contracts` should return a list of dicts with at least:
-            # { 'symbol','expiry','type','strike','mid','exp_roi','tier', ... }
-            if scored:
-                all_ranked.extend(scored)
-
+        except ValueError as ve:
+            # Our explicit validation errors
+            reason = str(ve)
+            if reason == "empty_frame":
+                logs.append(f"- [{symbol}] ⚠ Forecast issue: empty_frame")
+            elif reason == "no_valid_close":
+                logs.append(f"- [{symbol}] ⚠ Forecast issue: bad_snapshot (no valid close)")
+            elif reason == "no_close_column":
+                logs.append(f"- [{symbol}] ⚠ Forecast issue: bad_snapshot (no close column)")
+            else:
+                logs.append(f"- [{symbol}] ⚠ Forecast issue: {reason}")
         except Exception as e:
-            # Catch-all so one symbol doesn't kill the run
-            logs.append(f"- [{symbol}] ⚠ Unexpected: {e.__class__.__name__}: {str(e)}")
+            logs.append(f"- [{symbol}] ⚠ Unexpected: {type(e).__name__}: {e}")
 
-    # Partition into tiers
-    tier1: List[Dict[str, Any]] = []
-    tier2: List[Dict[str, Any]] = []
-    watch: List[Dict[str, Any]] = []
+    if not snapshots:
+        # Nothing usable — return empty buckets with logs
+        return {"tier1": tier1, "tier2": tier2, "watch": watch, "logs": logs}
 
-    for row in all_ranked:
-        tier = str(row.get("tier", "")).lower()
-        if tier == "tier1":
-            tier1.append(row)
-        elif tier == "tier2":
-            tier2.append(row)
-        elif tier in ("watch", "fallback", "top fallback"):
-            watch.append(row)
+    # Rank by score descending
+    snapshots.sort(key=lambda s: s.score, reverse=True)
 
-    # Sort tiers by whatever key your scorer emits (e.g., exp_roi desc)
-    def _sort_key(x: Dict[str, Any]):
-        return x.get("exp_roi", 0.0)
+    # Bucketization (adjust thresholds to taste)
+    #   Tier 1: strong positive score
+    #   Tier 2: mild positive score
+    #   Watch : top names even if score small/negative, limited count
+    for i, s in enumerate(snapshots):
+        idea = {
+            "symbol": s.symbol,
+            "last": round(s.last, 2),
+            "rsi": None if not math.isfinite(s.rsi) else round(s.rsi, 1),
+            "m1h_pct": None if not math.isfinite(s.m1h) else round(100 * s.m1h, 2),
+            "vol20": None if not math.isfinite(s.vol20) else round(s.vol20, 4),
+            "score": round(s.score, 2),
+        }
 
-    tier1.sort(key=_sort_key, reverse=True)
-    tier2.sort(key=_sort_key, reverse=True)
-    watch.sort(key=_sort_key, reverse=True)
-    all_ranked.sort(key=_sort_key, reverse=True)
+        if s.score >= 2.0:
+            tier1.append(idea)
+        elif s.score >= 0.5:
+            tier2.append(idea)
+        elif i < 10:  # keep a small watchlist
+            watch.append(idea)
 
-    return {
-        "tier1": tier1,
-        "tier2": tier2,
-        "watch": watch,
-        "all": all_ranked,
-        "logs": logs,
-    }
+    return {"tier1": tier1, "tier2": tier2, "watch": watch, "logs": logs}
