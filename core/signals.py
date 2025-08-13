@@ -1,219 +1,148 @@
 # core/signals.py
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 
-from core.fetch_data import get_price_history
+from .fetch_data import get_price_history, latest_close_series
 
 
-# ---------- utils
+# ---------- helpers: indicators kept 1‑D safe ----------
 
-def _clean_close_series(px: pd.DataFrame) -> pd.Series:
-    """
-    Ensure we return a numeric, 1-D close Series with NaNs dropped.
-    Raises ValueError if unusable.
-    """
-    if px is None or not isinstance(px, pd.DataFrame) or px.empty:
-        raise ValueError("empty_frame")
-
-    # Accept several common column spellings
-    for c in ("close", "Close", "adj_close", "Adj Close"):
-        if c in px.columns:
-            s = pd.to_numeric(px[c], errors="coerce").dropna()
-            if s.empty:
-                raise ValueError("no_valid_close")
-            return s
-
-    raise ValueError("no_close_column")
-
-
-def _rsi(series: pd.Series, period: int = 14) -> float:
-    """Simple RSI implementation that works on a 1‑D Series."""
-    if len(series) < period + 1:
-        return float("nan")
-    delta = series.diff()
-    up = delta.clip(lower=0.0)
-    down = -delta.clip(upper=0.0)
-    # Wilder's smoothing
-    roll_up = up.ewm(alpha=1 / period, adjust=False).mean()
-    roll_down = down.ewm(alpha=1 / period, adjust=False).mean()
-    rs = roll_up / roll_down.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return float(rsi.iloc[-1])
+def _rsi(close: pd.Series, window: int = 14) -> float:
+    """Return latest RSI value (float). Works on a *1‑D* close Series."""
+    s = latest_close_series(close)
+    if s.size < window + 1:
+        raise ValueError("too_few_points_for_rsi")
+    delta = s.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    roll_up = gain.rolling(window).mean()
+    roll_down = loss.rolling(window).mean()
+    rs = roll_up / (roll_down.replace(0, np.nan))
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    val = float(rsi.iloc[-1])
+    if np.isnan(val) or np.isinf(val):
+        raise ValueError("nan_rsi")
+    return val
 
 
-def _momentum(series: pd.Series, lookback: int) -> float:
-    """Percent change over lookback bars."""
-    if len(series) <= lookback:
-        return float("nan")
-    old = float(series.iloc[-lookback])
-    new = float(series.iloc[-1])
-    if not math.isfinite(old) or old == 0:
-        return float("nan")
-    return (new - old) / old
+def _zscore(close: pd.Series, window: int = 20) -> float:
+    s = latest_close_series(close)
+    if s.size < window:
+        raise ValueError("too_few_points_for_z")
+    roll = s.rolling(window)
+    mu = roll.mean().iloc[-1]
+    sd = roll.std(ddof=0).iloc[-1]
+    if sd == 0 or np.isnan(sd) or np.isnan(mu):
+        raise ValueError("bad_std")
+    return float((s.iloc[-1] - mu) / sd)
 
 
-def _vol(series: pd.Series, win: int = 20) -> float:
-    """Simple realized volatility proxy (std of returns)."""
-    if len(series) < win + 1:
-        return float("nan")
-    rets = series.pct_change().dropna()
-    if rets.empty:
-        return float("nan")
-    return float(rets.rolling(win).std().iloc[-1])
+def _mom(close: pd.Series, lookback: int = 5) -> float:
+    s = latest_close_series(close)
+    if s.size <= lookback:
+        raise ValueError("too_few_points_for_mom")
+    return float((s.iloc[-1] / s.iloc[-lookback]) - 1.0)
 
-
-# ---------- ranking logic (simple placeholder signals)
 
 @dataclass
-class SignalSnapshot:
+class Idea:
     symbol: str
-    last: float
     rsi: float
-    m1h: float
-    vol20: float
+    z: float
+    mom: float
     score: float
-    note: str = ""
 
 
-def _score_snapshot(s: SignalSnapshot) -> float:
+def _score(rsi: float, z: float, mom: float) -> float:
     """
-    Combine signals into a single score.
-    Tuned to be stable and monotonic; adjust as you like.
+    Simple combined score:
+    - Prefer mid‑range RSI (not overbought/oversold).
+    - Favor positive momentum.
+    - Favor mild positive z‑score (above mean, not extreme).
     """
-    score = 0.0
-
-    # Momentum helps; volatility penalizes; RSI mean-revert if extreme
-    if math.isfinite(s.m1h):
-        score += 100 * s.m1h  # scale momentum
-    if math.isfinite(s.vol20):
-        score -= 10 * s.vol20  # penalize choppy names
-
-    if math.isfinite(s.rsi):
-        # Mild premium if RSI is mid (not overbought/oversold),
-        # discount if very high/low (potential fade)
-        score -= max(0.0, s.rsi - 70) * 0.5
-        score -= max(0.0, 30 - s.rsi) * 0.5
-
-    return float(score)
+    # Normalize components to roughly comparable scales
+    rsi_penalty = -abs(rsi - 50.0) / 50.0  # 0 at 50; -1 at extremes
+    mom_term = mom  # momentum as %
+    z_term = -abs(z)  # prefer near 0 (mean‑reversion bias)
+    return 1.5 * rsi_penalty + 1.0 * mom_term + 0.2 * z_term
 
 
-# ---------- public API
+# ---------- public API ----------
 
-def generate_ranked_ideas(config: Dict) -> Dict[str, List[Dict]]:
+def generate_ranked_ideas(config: Dict) -> Dict[str, List[Dict] | List[str]]:
     """
-    Build ranked idea buckets.
+    Core entry point used by main.py.
 
-    config keys expected (keep loose on purpose):
+    Parameters (expected keys in `config`):
       - tickers: List[str]
-      - horizon_hours: int  (used only to size the pull; not critical)
-      - px_interval: str    (e.g., '5m', '15m', '1h' — passed through)
-      - min_bars: int       (safety; default 100)
-    Returns:
-      { "tier1": [...], "tier2": [...], "watch": [...], "logs": [...] }
+      - lookback_days: int
+      - px_interval: str (e.g., "1d", "1h")
+      - max_watchlist: int (fallback list size when no tiers)
+    Returns a dict with keys: 'tier1', 'tier2', 'watch', 'logs'
+    Each tier/watch entry is a dict describing the idea.
     """
     tickers: List[str] = config.get("tickers", [])
-    px_interval: str = config.get("px_interval", "5m")
-    horizon_hours: int = int(config.get("horizon_hours", 6))
-    min_bars: int = int(config.get("min_bars", 100))
-
-    # Pull a few extra hours to make sure we have enough bars
-    pull_hours = max(horizon_hours, 6) + 24
+    lookback_days: int = int(config.get("lookback_days", 60))
+    px_interval: str = str(config.get("px_interval", "1d"))
+    max_watch: int = int(config.get("max_watchlist", 10))
 
     tier1: List[Dict] = []
     tier2: List[Dict] = []
     watch: List[Dict] = []
     logs: List[str] = []
 
-    snapshots: List[SignalSnapshot] = []
+    candidates: List[Idea] = []
 
     for symbol in tickers:
         try:
-            # Fetch prices
-            px = get_price_history(symbol, interval=px_interval, hours=pull_hours)
+            px = get_price_history(symbol, lookback_days=lookback_days, interval=px_interval)
+            closes = latest_close_series(px)
 
-            # Always reduce to a 1-D close series
-            closes = _clean_close_series(px)
-
-            if len(closes) < min_bars:
-                logs.append(f"- [{symbol}] ⚠ Forecast issue: too_few_bars ({len(closes)})")
-                continue
-
-            # Make sure latest price is finite
-            last = float(closes.iloc[-1])
-            if not math.isfinite(last):
+            # Basic sanity checks
+            if closes.empty or closes.size < 25 or not np.isfinite(closes.iloc[-1]):
                 logs.append(f"- [{symbol}] ⚠ Forecast issue: bad_snapshot (invalid last close)")
                 continue
 
-            # Features computed off the 1‑D close series only
-            # map 1h momentum to bars depending on interval
-            interval_to_minutes = {
-                "1m": 1, "2m": 2, "5m": 5, "10m": 10, "15m": 15, "30m": 30,
-                "60m": 60, "1h": 60
-            }
-            minutes = interval_to_minutes.get(px_interval, 5)
-            lookback_bars_1h = max(1, 60 // max(1, minutes))  # e.g., 12 bars for 5m
+            rsi = _rsi(closes, window=14)
+            z = _zscore(closes, window=20)
+            mom = _mom(closes, lookback=5)
+            score = _score(rsi, z, mom)
 
-            rsi = _rsi(closes, period=14)
-            m1h = _momentum(closes, lookback_bars_1h)
-            vol20 = _vol(closes, win=20)
+            candidates.append(Idea(symbol=symbol, rsi=rsi, z=z, mom=mom, score=score))
 
-            snap = SignalSnapshot(
-                symbol=symbol,
-                last=last,
-                rsi=rsi,
-                m1h=m1h,
-                vol20=vol20,
-                score=0.0,
-            )
-            snap.score = _score_snapshot(snap)
-            snapshots.append(snap)
-
-        except ValueError as ve:
-            # Our explicit validation errors
-            reason = str(ve)
-            if reason == "empty_frame":
-                logs.append(f"- [{symbol}] ⚠ Forecast issue: empty_frame")
-            elif reason == "no_valid_close":
-                logs.append(f"- [{symbol}] ⚠ Forecast issue: bad_snapshot (no valid close)")
-            elif reason == "no_close_column":
-                logs.append(f"- [{symbol}] ⚠ Forecast issue: bad_snapshot (no close column)")
-            else:
-                logs.append(f"- [{symbol}] ⚠ Forecast issue: {reason}")
         except Exception as e:
-            logs.append(f"- [{symbol}] ⚠ Unexpected: {type(e).__name__}: {e}")
+            # Keep the engine resilient — log and move on.
+            logs.append(f"- [{symbol}] ⚠ Unexpected: {type(e).__name__}: {e!s}")
 
-    if not snapshots:
-        # Nothing usable — return empty buckets with logs
-        return {"tier1": tier1, "tier2": tier2, "watch": watch, "logs": logs}
+    # Rank by score (desc)
+    if candidates:
+        ranked = sorted(candidates, key=lambda x: x.score, reverse=True)
 
-    # Rank by score descending
-    snapshots.sort(key=lambda s: s.score, reverse=True)
+        # Simple bucketing: top 2 -> tier1, next 3 -> tier2, rest -> watch (up to max_watch)
+        for i, idea in enumerate(ranked):
+            entry = {
+                "symbol": idea.symbol,
+                "rsi": round(idea.rsi, 2),
+                "zscore": round(idea.z, 2),
+                "momentum_5": round(idea.mom * 100, 2),  # %
+                "score": round(idea.score, 4),
+            }
+            if i < 2:
+                tier1.append(entry)
+            elif i < 5:
+                tier2.append(entry)
+            elif len(watch) < max_watch:
+                watch.append(entry)
 
-    # Bucketization (adjust thresholds to taste)
-    #   Tier 1: strong positive score
-    #   Tier 2: mild positive score
-    #   Watch : top names even if score small/negative, limited count
-    for i, s in enumerate(snapshots):
-        idea = {
-            "symbol": s.symbol,
-            "last": round(s.last, 2),
-            "rsi": None if not math.isfinite(s.rsi) else round(s.rsi, 1),
-            "m1h_pct": None if not math.isfinite(s.m1h) else round(100 * s.m1h, 2),
-            "vol20": None if not math.isfinite(s.vol20) else round(s.vol20, 4),
-            "score": round(s.score, 2),
-        }
-
-        if s.score >= 2.0:
-            tier1.append(idea)
-        elif s.score >= 0.5:
-            tier2.append(idea)
-        elif i < 10:  # keep a small watchlist
-            watch.append(idea)
-
-    return {"tier1": tier1, "tier2": tier2, "watch": watch, "logs": logs}
+    # If nothing made it (e.g., bad data day), keep watch empty or filled with top symbols we tried
+    return {
+        "tier1": tier1,
+        "tier2": tier2,
+        "watch": watch,
+        "logs": logs,
+    }
