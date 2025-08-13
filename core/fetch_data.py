@@ -1,164 +1,261 @@
 # core/fetch_data.py
+# Fetches intraday price history and returns a clean DataFrame with
+# columns: ['datetime','open','high','low','close','volume']
+# - Normalizes provider column names
+# - Ensures numeric types
+# - Drops the most-recent incomplete bar (missing/NaN close)
+# - Filters to the last `hours` of data
 
 from __future__ import annotations
 
-import math
-import sys
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
 
+# yfinance is the default data source; it’s commonly available on GH runners.
+# If you’re using another source, you can adapt the _fetch_* function below.
 try:
     import yfinance as yf
-except Exception as e:  # pragma: no cover
-    print(f"[IMPORT][ERROR] Could not import yfinance: {e}", file=sys.stderr)
-    raise
+    _HAS_YFINANCE = True
+except Exception:
+    _HAS_YFINANCE = False
 
 
-# ---------- internal helpers ----------
+# ---------- Public API ----------
 
-def _period_from_lookback(lookback_days: int, interval: str) -> str:
+def get_price_history(
+    symbol: str,
+    *,
+    interval: str = "5m",
+    hours: int = 8,
+    source: str = "yfinance",
+    drop_incomplete_last: bool = True,
+) -> pd.DataFrame:
     """
-    Convert a lookback in *calendar* days to a yfinance 'period' string,
-    respecting Yahoo's per-interval limits.
+    Fetch normalized intraday OHLCV for `symbol`.
 
-    Yahoo limits (approx):
-      - 1m:   up to 7d
-      - 2m/5m/15m/30m/60m/90m: up to 60d
-      - 1h:   up to 730d (varies)
-      - 1d/1wk/1mo: long history supported
-
-    We clamp to safe values to avoid empty frames.
+    Returns a DataFrame with:
+        ['datetime','open','high','low','close','volume']  (all lowercase)
+    Datetimes are timezone-aware in UTC, sorted ascending.
     """
-    iv = interval.strip().lower()
+    if hours <= 0:
+        hours = 8
 
-    # Minimum 2 days for intraday to ensure we cross non-trading days/weekends.
-    min_days = 2 if any(s in iv for s in ("m", "h")) else 1
-
-    # Upper clamps by interval (safe defaults)
-    if iv == "1m":
-        max_days = 7
-    elif any(iv.startswith(x) for x in ("2m", "5m", "15m", "30m", "60m", "90m")):
-        max_days = 60
+    if source.lower() == "yfinance":
+        if not _HAS_YFINANCE:
+            raise RuntimeError("yfinance not available but source='yfinance' requested.")
+        raw = _fetch_yfinance(symbol, interval=interval, hours=hours)
     else:
-        # Daily/weekly/monthly — allow larger windows
-        max_days = max(lookback_days, 365)
+        raise ValueError(f"Unsupported source '{source}'. Only 'yfinance' is implemented.")
 
-    days = max(min_days, min(int(lookback_days), max_days))
-    return f"{days}d"
+    df = _normalize_ohlcv(raw)
+
+    # keep just the last `hours` of data
+    now_utc = datetime.now(timezone.utc)
+    earliest = now_utc - timedelta(hours=hours)
+    if "datetime" in df.columns:
+        df = df[df["datetime"] >= earliest]
+
+    # drop any rows without a numeric close
+    df = df[pd.to_numeric(df["close"], errors="coerce").notna()]
+
+    # drop most recent row if it's incomplete or NaN close
+    if drop_incomplete_last and not df.empty:
+        df = _drop_incomplete_last_bar(df, interval)
+
+    if df.empty or df["close"].isna().all():
+        # Let the caller decide what to do; downstream code will surface as 'bad_snapshot'
+        raise ValueError(f"No valid close found for {symbol} (interval={interval}, hours={hours}).")
+
+    return df.reset_index(drop=True)
 
 
-def _clean_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    """Basic NA cleaning + sanity checks."""
-    if df is None or df.empty:
-        return None
+# ---------- Provider fetchers ----------
 
-    # Standardize columns we expect
-    expected = {"Open", "High", "Low", "Close", "Adj Close", "Volume"}
-    missing = expected.difference(set(df.columns))
-    if missing:
-        # Some intervals/markets omit "Adj Close" intraday; that’s fine.
-        # Only error if we’re missing core OHLC.
-        core_missing = {"Open", "High", "Low", "Close"}.intersection(missing)
-        if core_missing:
-            print(f"[CLEAN][WARN] Missing core columns: {sorted(core_missing)}")
-            # Try to recover if 'Adj Close' exists instead of 'Close'
-            if "Close" in core_missing and "Adj Close" in df.columns:
-                df["Close"] = df["Adj Close"]
+def _fetch_yfinance(symbol: str, *, interval: str, hours: int) -> pd.DataFrame:
+    """
+    Use yfinance to pull intraday bars. yfinance limits the allowed period by interval.
+    We choose a safe period that covers the requested `hours`.
+    """
+    interval = _normalize_interval(interval)
 
-    # Drop all-NA rows, then forward/back-fill small gaps
-    df = df.dropna(how="all")
-    if df.empty:
-        return None
-
-    df = df.ffill().bfill()
-
-    # Ensure numeric dtypes for OHLCV where present
-    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
-        if col in df.columns:
-            try:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            except Exception:
-                pass
-
-    df = df.dropna(how="any", subset=[c for c in ["Open", "High", "Low", "Close"] if c in df.columns])
-    if df.empty:
-        return None
-
-    # Ensure index is tz-aware (UTC) so downstream math doesn’t choke
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+    # period mapping based on yfinance rules
+    # ref: yfinance intraday periods; we pick something roomy to ensure enough bars
+    needed_hours = max(1, hours)
+    if interval in {"1m"}:
+        period = "7d"          # 1m bars need period <= 7d
+    elif interval in {"2m", "5m", "15m"}:
+        period = "30d"         # safe for these intervals
+    elif interval in {"30m", "60m", "90m", "1h"}:
+        period = "60d"
     else:
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-        else:
-            df.index = df.index.tz_convert("UTC")
+        # for daily or anything else, ask for 90d
+        period = "90d"
 
-    return df
+    # Fetch
+    # auto_adjust=False -> we get raw OHLCV; we’ll just use Close as-is
+    df = yf.download(
+        tickers=symbol,
+        interval=interval,
+        period=period,
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+    )
 
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
 
-# ---------- public API ----------
-
-def fetch_data(symbol: str, period: str = "5d", interval: str = "15m") -> Optional[pd.DataFrame]:
-    """
-    Fetch OHLCV data from Yahoo Finance with sensible defaults and robust cleaning.
-    Returns a cleaned pandas DataFrame indexed by UTC timestamps, or None on failure.
-    """
-    symbol = symbol.upper().strip()
-    iv = interval.strip().lower()
-    per = period.strip().lower()
-
-    print(f"[FETCH] {symbol} period={per} interval={iv}")
-
-    try:
-        df = yf.download(
-            symbol,
-            period=per,
-            interval=iv,
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
-    except Exception as e:
-        print(f"[FETCH][ERROR] {symbol} yfinance.download failed: {e}")
-        return None
-
-    if df is None or df.empty:
-        print(f"[FETCH][WARN] {symbol} returned EMPTY frame (period={per}, interval={iv})")
-        return None
-
-    # yfinance sometimes returns a multi-indexed column when multiple tickers are used.
-    # Make sure we’re on a single symbol frame.
+    # yfinance may return a MultiIndex on columns for some tickers
     if isinstance(df.columns, pd.MultiIndex):
-        try:
-            df = df.xs(symbol, axis=1, level=0)
-        except Exception:
-            # Fallback: pick the first level
-            df = df.droplevel(0, axis=1)
+        # Typical columns look like [('Open', ''), ('High',''), ...]
+        df.columns = [c[0] for c in df.columns]
 
-    print(f"[FETCH][DEBUG] {symbol} raw rows={len(df)} head:\n{df.head(3)}")
+    df = df.copy()
 
-    df = _clean_df(df)
-    if df is None:
-        print(f"[FETCH][WARN] {symbol} frame empty after cleaning")
-        return None
+    # Ensure DatetimeIndex -> column
+    if isinstance(df.index, pd.DatetimeIndex):
+        # yfinance returns exchange tz; convert to UTC and make tz-aware
+        idx = df.index.tz_convert("UTC") if df.index.tz is not None else df.index.tz_localize("UTC")
+        df.insert(0, "datetime", idx.to_pydatetime())
+        df.reset_index(drop=True, inplace=True)
+    else:
+        # Fallback: create a naive datetime column if something odd happens
+        df.insert(0, "datetime", pd.to_datetime(df.index, utc=True))
+        df.reset_index(drop=True, inplace=True)
 
-    print(f"[FETCH][OK] {symbol} cleaned rows={len(df)} last={df.index[-1].isoformat()}")
     return df
 
 
-def get_price_history(symbol: str, lookback_days: int = 5, interval: str = "15m") -> Optional[pd.DataFrame]:
+# ---------- Normalization & helpers ----------
+
+_COLMAP = {
+    # common variants -> our canonical lowercase
+    "datetime": "datetime",
+    "date": "datetime",
+    "time": "datetime",
+    "timestamp": "datetime",
+
+    "open": "open",
+    "high": "high",
+    "low": "low",
+    "close": "close",
+    "adj close": "close",
+    "adj_close": "close",
+    "last": "close",
+    "price": "close",
+
+    "volume": "volume",
+    "vol": "volume",
+}
+
+def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
+
+    # Lowercase columns first
+    cols_lower = {c: str(c).strip().lower() for c in df.columns}
+    df = df.rename(columns=cols_lower)
+
+    # Map to canonical names
+    remapped = {}
+    for c in df.columns:
+        remapped[c] = _COLMAP.get(c, c)
+    df = df.rename(columns=remapped)
+
+    # If we still don't have the essentials, try to infer
+    needed = {"datetime", "open", "high", "low", "close", "volume"}
+    for need in needed:
+        if need not in df.columns:
+            if need == "volume" and "shares" in df.columns:
+                df = df.rename(columns={"shares": "volume"})
+            elif need == "datetime" and isinstance(df.index, pd.DatetimeIndex):
+                # make an explicit datetime column
+                idx = df.index
+                idx = idx.tz_convert("UTC") if idx.tz is not None else idx.tz_localize("UTC")
+                df.insert(0, "datetime", idx.to_pydatetime())
+            else:
+                # create missing with NaN to keep schema
+                df[need] = pd.NA
+
+    # Cast dtypes
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Coerce datetime column to UTC tz-aware
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+
+    # Keep only the canonical columns in order
+    df = df[["datetime", "open", "high", "low", "close", "volume"]].dropna(subset=["datetime"])
+
+    # Sort ascending time
+    df = df.sort_values("datetime")
+
+    return df
+
+
+def _normalize_interval(interval: str) -> str:
+    """Normalize common interval aliases (e.g., '1h' -> '60m')."""
+    s = interval.strip().lower()
+    if s in {"60m", "1h"}:
+        return "60m"
+    if s in {"30m"}:
+        return "30m"
+    if s in {"15m"}:
+        return "15m"
+    if s in {"5m"}:
+        return "5m"
+    if s in {"1m"}:
+        return "1m"
+    if s in {"90m", "1.5h"}:
+        return "90m"
+    if s in {"1d", "d", "day", "daily"}:
+        return "1d"
+    return s  # pass through
+
+
+def _interval_to_timedelta(interval: str) -> Optional[timedelta]:
+    s = _normalize_interval(interval)
+    if s.endswith("m"):
+        try:
+            minutes = int(s[:-1])
+            return timedelta(minutes=minutes)
+        except Exception:
+            return None
+    if s.endswith("d"):
+        try:
+            days = int(s[:-1])
+            return timedelta(days=days)
+        except Exception:
+            return None
+    return None
+
+
+def _drop_incomplete_last_bar(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     """
-    Backwards-compatible wrapper used elsewhere in the codebase:
-    accepts lookback_days + interval and converts to a safe 'period' for yfinance.
+    Remove the last row if it looks incomplete (NaN close) or
+    if its timestamp is within the current interval window (i.e., candle still forming).
     """
-    try:
-        period = _period_from_lookback(int(lookback_days), interval)
-    except Exception:
-        period = _period_from_lookback(5, interval)
+    if df.empty:
+        return df
 
-    return fetch_data(symbol=symbol, period=period, interval=interval)
+    df = df.copy()
+    last_idx = df.index[-1]
+    last_row = df.loc[last_idx]
 
+    # If close is NaN -> drop it
+    if pd.isna(last_row.get("close")):
+        return df.iloc[:-1]
 
-__all__ = ["fetch_data", "get_price_history"]
+    # If candle still forming (timestamp within the current interval window), drop it
+    step = _interval_to_timedelta(interval)
+    if step is not None:
+        now_utc = datetime.now(timezone.utc)
+        last_dt: datetime = last_row["datetime"]
+        # if last_dt is too close to now (less than interval), drop it
+        if (now_utc - last_dt) < step:
+            return df.iloc[:-1]
+
+    return df
