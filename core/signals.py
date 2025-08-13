@@ -3,311 +3,257 @@ from __future__ import annotations
 
 import math
 import traceback
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Tuple, Any
 
-import numpy as np
 import pandas as pd
 
-# ---- Local imports (robust to package/relative layout) ----------------------
-try:
-    from core.fetch_data import get_price_history
-except Exception:  # pragma: no cover
-    from .fetch_data import get_price_history  # type: ignore
+# ---- Internal imports (must exist in your repo) -----------------------------
+from .fetch_data import get_price_history                   # returns a pd.DataFrame or None
+from .features import add_features, latest_snapshot         # your existing feature builders
+from .filter_options import filter_contracts                # you said you already have this
+from .scoring import score_contracts                        # ranks contracts
 
-try:
-    from core.options import get_option_chain_near_money
-except Exception:  # pragma: no cover
-    from .options import get_option_chain_near_money  # type: ignore
+# ----------------------------------------------------------------------------
+# Yahoo-style limits (practical caps to avoid empty returns)
+# ----------------------------------------------------------------------------
+_INTRA_LIMITS = {
+    "1m": 7,          # days
+    "2m": 60,
+    "5m": 60,
+    "15m": 60,
+    "30m": 60,
+    "60m": 730,       # ~2y, but many providers clamp tighter; we keep generous
+    "90m": 730,
+    "1h": 730,
+}
+_DAILY_INTERVALS = {"1d", "1wk", "1mo"}
 
-try:
-    from core.features import add_features, latest_snapshot, exp_dS, exp_dIV
-except Exception:  # pragma: no cover
-    from .features import add_features, latest_snapshot, exp_dS, exp_dIV  # type: ignore
-
-try:
-    from core.filter_options import filter_contracts
-except Exception:  # pragma: no cover
-    from .filter_options import filter_contracts  # type: ignore
-
-try:
-    from core.scoring import score_contracts
-except Exception:  # pragma: no cover
-    from .scoring import score_contracts  # type: ignore
+# Reason labels used in logs
+REASON_BAD_SNAPSHOT = "bad_snapshot"
+REASON_NO_DATA = "no_data"
+REASON_UNEXPECTED = "unexpected"
 
 
-# ---------------------------------------------------------------------------
+def _cap_lookback_for_interval(interval: str, lookback_days: int) -> int:
+    """Clamp lookback to something the data source will actually serve."""
+    if interval in _INTRA_LIMITS:
+        limit = _INTRA_LIMITS[interval]
+        return min(lookback_days, limit)
+    return lookback_days
 
-def _safe_float(x: Any, default: float = 0.0) -> float:
+
+def _is_intraday(interval: str) -> bool:
+    return interval not in _DAILY_INTERVALS
+
+
+def _safe_fetch_prices(
+    symbol: str,
+    lookback_days: int,
+    interval: str,
+    *,
+    enable_fallback: bool = True,
+) -> Tuple[pd.DataFrame | None, List[str]]:
+    """
+    Tries to fetch OHLCV with sensible clamping + fallbacks.
+    Returns (df_or_none, debug_lines)
+    """
+    dbg: List[str] = []
     try:
-        if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
-            return default
-        return float(x)
-    except Exception:
-        return default
+        lb = _cap_lookback_for_interval(interval, lookback_days)
+        if lb != lookback_days:
+            dbg.append(f"[{symbol}] capped lookback_days {lookback_days} -> {lb} for interval {interval}")
+        df = get_price_history(symbol, lookback_days=lb, interval=interval)
+
+        if df is not None and not df.empty:
+            dbg.append(f"[{symbol}] primary fetch OK: rows={len(df)}, interval={interval}, lb_days={lb}")
+            return df, dbg
+
+        dbg.append(f"[{symbol}] primary fetch EMPTY: interval={interval}, lb_days={lb}")
+
+        if not enable_fallback:
+            return None, dbg
+
+        # ---- Fallbacks -----------------------------------------------------
+        # 1) If intraday request failed, try a coarser intraday interval
+        if _is_intraday(interval):
+            fallback_chain = []
+            # Prefer stepping up to 15m, then 30m, then 60m for stability
+            if interval != "15m":
+                fallback_chain.append(("15m", _cap_lookback_for_interval("15m", lookback_days)))
+            if interval != "30m":
+                fallback_chain.append(("30m", _cap_lookback_for_interval("30m", lookback_days)))
+            if interval not in ("60m", "1h"):
+                fallback_chain.append(("60m", _cap_lookback_for_interval("60m", lookback_days)))
+
+            for iv, lb2 in fallback_chain:
+                try:
+                    df2 = get_price_history(symbol, lookback_days=lb2, interval=iv)
+                    if df2 is not None and not df2.empty:
+                        dbg.append(f"[{symbol}] intraday fallback OK: rows={len(df2)}, interval={iv}, lb_days={lb2}")
+                        return df2, dbg
+                    dbg.append(f"[{symbol}] intraday fallback EMPTY: interval={iv}, lb_days={lb2}")
+                except Exception as e:
+                    dbg.append(f"[{symbol}] intraday fallback ERR {iv}: {e}")
+
+        # 2) Final fallback to daily bars so we always get *something*
+        daily_lb = max(lookback_days, 30)
+        try:
+            df3 = get_price_history(symbol, lookback_days=daily_lb, interval="1d")
+            if df3 is not None and not df3.empty:
+                dbg.append(f"[{symbol}] daily fallback OK: rows={len(df3)}, interval=1d, lb_days={daily_lb}")
+                return df3, dbg
+            dbg.append(f"[{symbol}] daily fallback EMPTY: interval=1d, lb_days={daily_lb}")
+        except Exception as e:
+            dbg.append(f"[{symbol}] daily fallback ERR 1d: {e}")
+
+        return None, dbg
+
+    except Exception as e:
+        dbg.append(f"[{symbol}] _safe_fetch_prices() UNEXPECTED: {e}")
+        return None, dbg
 
 
-def _expected_price_change_greeks(
-    delta: float,
-    gamma: float,
-    theta_day: float,
-    vega: float,
-    rho: float,
-    dS: float,
-    dIV_pts: float,
-    horizon_hours: float,
-    dRate: float = 0.0,
-) -> float:
-    """
-    Taylor approximation of option PnL using Greeks.
-    theta_day is per-calendar-day; convert for horizon in hours.
-    dIV_pts = change in IV in percentage points (e.g. +0.5 pt -> 0.5)
-    """
-    theta_part = theta_day * (horizon_hours / 24.0)
-    vega_part = vega * (dIV_pts / 100.0)  # convert pts to decimal
-    rho_part = rho * dRate
-    return (delta * dS) + (0.5 * gamma * (dS ** 2)) + theta_part + vega_part + rho_part
+def _make_issue(symbol: str, reason: str, detail: str) -> str:
+    """Uniform log line."""
+    return f"- [{symbol}] ⚠ Forecast issue: {reason} ({detail})"
 
 
-def _tier_split(
-    rows: List[Dict[str, Any]],
-    tier1_min_score: float,
-    tier2_min_score: float,
-    min_roi: float,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Split ranked rows into tier1 / tier2 / watch by score and ROI."""
-    t1, t2, watch = [], [], []
-    for r in rows:
-        sc = _safe_float(r.get("score"), 0.0)
-        roi = _safe_float(r.get("exp_roi"), 0.0)
-        if sc >= tier1_min_score and roi >= min_roi:
-            t1.append(r)
-        elif sc >= tier2_min_score and roi >= min_roi:
-            t2.append(r)
+def _clean_recent_nans(df: pd.DataFrame, symbol: str, dbg: List[str]) -> pd.DataFrame:
+    """Drop leading/trailing all-NaN rows; keep middle NaNs for features to handle."""
+    before = len(df)
+    # Keep index; drop rows where close is NaN
+    if "close" in df.columns:
+        df2 = df.dropna(subset=["close"])
+    else:
+        # Try standard Yahoo column capitalization if features expect 'Close'
+        col = "Close" if "Close" in df.columns else None
+        if col:
+            df2 = df.dropna(subset=[col])
         else:
-            watch.append(r)
-    return t1, t2, watch
+            dbg.append(f"[{symbol}] no close column found; columns={list(df.columns)}")
+            return df
+    after = len(df2)
+    if after != before:
+        dbg.append(f"[{symbol}] dropped NaN-close rows: {before} -> {after}")
+    return df2
 
 
 def generate_ranked_ideas(config: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Scan tickers, build features/forecast, pull near-money options,
-    filter & score, then compute expected PnL for a horizon.
+    Main entry point used by main.py
+
+    Expected keys in config (defaults applied if missing):
+      - tickers: List[str]
+      - lookback_days: int (default 30)
+      - px_interval: str (default "15m")
+      - horizon_hours: int (default 2)                # used by your features/scoring
+      - filter_cfg: Dict[str, Any] (default {})
+      - top_n_watch: int (default 20)                 # for watchlist fallback
+
     Returns:
-        {
-          "tier1": [...],
-          "tier2": [...],
-          "watch": [...],
-          "all": [...],
-          "logs": [...]
-        }
+      {
+        "tier1": List[Dict],          # high conviction
+        "tier2": List[Dict],          # moderate
+        "watch": List[Dict],          # top fallback if tiers are empty
+        "all":   List[Dict],          # all scored contracts (filtered)
+        "logs":  List[str],           # human-readable logs for email
+      }
     """
-    # -------------------- Read config with sensible defaults -----------------
-    tickers: List[str] = list(config.get("tickers", []))
-    horizon_hours: float = float(config.get("horizon_hours", 2))
+    tickers: List[str] = config.get("tickers", [])
     lookback_days: int = int(config.get("lookback_days", 30))
-    px_interval: str = str(config.get("px_interval", "1h"))
-
-    # Option filters
-    max_dte: int = int(config.get("max_dte", 14))
-    strikes_width: float = float(config.get("strikes_width", 8))  # +/- dollars window
-    min_oi: int = int(config.get("min_oi", 100))
-    max_spread_pct: float = float(config.get("max_spread_pct", 35))  # e.g., 35 (%)
-
-    # Ranking / ROI gates
-    tier1_min_score: float = float(config.get("tier1_min_score", 0.80))
-    tier2_min_score: float = float(config.get("tier2_min_score", 0.60))
-    min_roi: float = float(config.get("min_roi", 15.0))  # percent
-    top_k: int = int(config.get("top_k", 40))  # keep many; tiers will trim naturally
-
-    # Biasing of expected IV move
-    dIV_pts_default: float = float(config.get("exp_dIV_pts", 0.5))  # +0.5 vol-pts default
-    bias_mode: str = str(config.get("bias_mode", "revert")).lower()
-    # -------------------------------------------------------------------------
+    px_interval: str = str(config.get("px_interval", "15m"))
+    horizon_hours: int = int(config.get("horizon_hours", 2))
+    filter_cfg: Dict[str, Any] = config.get("filter_cfg", {}) or {}
+    top_n_watch: int = int(config.get("top_n_watch", 20))
 
     logs: List[str] = []
-    all_rows: List[Dict[str, Any]] = []
+    all_scored: List[Dict[str, Any]] = []
+    per_symbol_debug: List[str] = []
 
     for symbol in tickers:
         try:
-            # ------- Prices & features
-            px = get_price_history(symbol, lookback_days=lookback_days, interval=px_interval)
-            if px is None or len(px) < 25:
-                logs.append(f"[{symbol}] ⚠ Forecast issue: not_enough_data")
+            # -------- robust fetch with fallback + detailed debug -------------
+            px, dbg = _safe_fetch_prices(symbol, lookback_days, px_interval, enable_fallback=True)
+            per_symbol_debug.extend(dbg)
+
+            if px is None or px.empty:
+                logs.append(_make_issue(symbol, REASON_NO_DATA, "empty after fallbacks"))
                 continue
 
-            try:
-                feat = add_features(px)
-            except Exception:
-                # proceed even if extra features fail
-                feat = px.copy()
+            # standardize columns for features if needed
+            # Expecting columns roughly like: index=Datetime, ['open','high','low','close','volume']
+            # If provider returns 'Open' etc, lower them:
+            lowered = {c: c.lower() for c in px.columns}
+            if any(c.isupper() for c in px.columns):
+                px = px.rename(columns=lowered)
 
-            snap = latest_snapshot(px)
-            if snap is None or "price" not in snap:
-                logs.append(f"[{symbol}] ⚠ Forecast issue: bad_snapshot")
+            # basic cleanliness
+            px = _clean_recent_nans(px, symbol, per_symbol_debug)
+            if px is None or px.empty:
+                logs.append(_make_issue(symbol, REASON_BAD_SNAPSHOT, "no rows after cleaning"))
                 continue
 
-            # Expected underlying move (dS) & IV change (dIV in vol points)
-            try:
-                dS = float(exp_dS(px, horizon_hours=horizon_hours, bias_mode=bias_mode))
-            except Exception:
-                # Fallback: use recent hourly vol
-                rets = np.diff(np.log(px["Close"].astype(float).values))
-                dS = float(np.std(rets[-48:]) * snap["price"]) if len(rets) > 0 else 0.0
-
-            try:
-                dIV_pts = float(exp_dIV(px))
-            except Exception:
-                dIV_pts = dIV_pts_default
-
-            # ------- Option chain (near-money within +/- strikes_width, <= max_dte)
-            try:
-                chain = get_option_chain_near_money(
-                    symbol,
-                    snapshot=snap,
-                    max_dte=max_dte,
-                    strikes_width=strikes_width,
-                )
-            except TypeError:
-                # older signature fallback
-                try:
-                    chain = get_option_chain_near_money(symbol, snap)
-                except Exception as e_chain:
-                    logs.append(f"[{symbol}] ⚠ Chain error: {e_chain}")
-                    continue
-            except Exception as e_chain:
-                logs.append(f"[{symbol}] ⚠ Chain error: {e_chain}")
+            # quick sanity: last close should be finite
+            last_close = px["close"].iloc[-1] if "close" in px.columns else float("nan")
+            if last_close is None or isinstance(last_close, float) and (math.isnan(last_close) or math.isinf(last_close)):
+                logs.append(_make_issue(symbol, REASON_BAD_SNAPSHOT, "invalid last close"))
                 continue
 
-            if not isinstance(chain, list) or len(chain) == 0:
-                logs.append(f"[{symbol}] ⚠ No contracts pulled")
+            # -------- features & snapshot ------------------------------------
+            # Your add_features should add exp_dS/exp_dIV etc based on horizon_hours
+            px_feat = add_features(px, horizon_hours=horizon_hours)
+            snap = latest_snapshot(px_feat)
+            if snap is None:
+                logs.append(_make_issue(symbol, REASON_BAD_SNAPSHOT, "latest_snapshot returned None"))
                 continue
 
-            # ------- Liquidity/quality filters
-            try:
-                filtered = filter_contracts(
-                    chain,
-                    min_oi=min_oi,
-                    max_spread_pct=max_spread_pct,
-                    strikes_width=strikes_width,
-                    max_dte=max_dte,
-                )
-            except Exception:
-                # permissive fallback: manual filter
-                filtered = []
-                for c in chain:
-                    bid = _safe_float(c.get("bid"))
-                    ask = _safe_float(c.get("ask"))
-                    mid = _safe_float(c.get("mid"), (bid + ask) / 2.0 if (bid > 0 and ask > 0) else 0.0)
-                    spread_pct = (ask - bid) / ask * 100.0 if ask > 0 else 999.0
-                    if c.get("open_interest", c.get("oi", 0)) and spread_pct <= max_spread_pct:
-                        if abs(_safe_float(c.get("strike")) - _safe_float(snap["price"])) <= strikes_width:
-                            if int(c.get("dte", 999)) <= max_dte:
-                                c["mid"] = mid
-                                filtered.append(c)
-
-            if len(filtered) == 0:
-                logs.append(f"[{symbol}] ⚠ No liquid near-money contracts after filters.")
+            # -------- get/score options --------------------------------------
+            # filter_contracts must create a universe for this symbol using 'snap'
+            contracts = filter_contracts(symbol, snap, cfg=filter_cfg)
+            if not contracts:
+                logs.append(_make_issue(symbol, "no_contracts", "no liquid contracts after filter"))
                 continue
 
-            # ------- Compute expected change & ROI via Greeks
-            enriched: List[Dict[str, Any]] = []
-            for c in filtered:
-                mid = _safe_float(c.get("mid"))
-                if mid <= 0:
-                    continue
+            scored = score_contracts(contracts, horizon_hours=horizon_hours)
+            for row in scored:
+                row["_symbol"] = symbol  # tag for later grouping
+            all_scored.extend(scored)
 
-                delta = _safe_float(c.get("delta"))
-                gamma = _safe_float(c.get("gamma"))
-                theta_day = _safe_float(c.get("theta_day") or c.get("theta"))  # per day preferred
-                vega = _safe_float(c.get("vega"))
-                rho = _safe_float(c.get("rho"))
+        except Exception as e:
+            logs.append(_make_issue(symbol, REASON_UNEXPECTED, str(e)))
+            per_symbol_debug.append(f"[{symbol}] Traceback:\n{traceback.format_exc()}")
 
-                # direction-aware dS (put: negative if we expect down move, call: positive)
-                typ = str(c.get("type", "")).lower()
-                dS_dir = dS if typ == "call" else (-dS if typ == "put" else dS)
+    # ----------------- rank + tiers ------------------------------------------
+    if not all_scored:
+        # Include useful fetch/debug lines when nothing scored
+        logs.extend(per_symbol_debug)
+        return {
+            "tier1": [],
+            "tier2": [],
+            "watch": [],
+            "all": [],
+            "logs": logs,
+        }
 
-                pnl = _expected_price_change_greeks(
-                    delta=delta,
-                    gamma=gamma,
-                    theta_day=theta_day,
-                    vega=vega,
-                    rho=rho,
-                    dS=dS_dir,
-                    dIV_pts=dIV_pts,
-                    horizon_hours=horizon_hours,
-                    dRate=0.0,
-                )
-                roi = (pnl / mid) * 100.0
+    # Sort by our score (descending). Your score_contracts must add 'score'.
+    all_scored.sort(key=lambda r: r.get("score", 0.0), reverse=True)
 
-                row = dict(c)  # copy
-                row.update(
-                    {
-                        "symbol": symbol,
-                        "exp_dS": round(dS, 3),
-                        "exp_dIV_pts": round(dIV_pts, 3),
-                        "horizon_h": horizon_hours,
-                        "exp_change": round(pnl, 2),
-                        "exp_roi": round(roi, 2),
-                    }
-                )
-                enriched.append(row)
+    # Split tiers by simple thresholds; you can tune these
+    tier1 = [r for r in all_scored if r.get("score", 0.0) >= 0.80]
+    tier2 = [r for r in all_scored if 0.60 <= r.get("score", 0.0) < 0.80]
 
-            if len(enriched) == 0:
-                logs.append(f"[{symbol}] ⚠ Contracts filtered out after PnL calc")
-                continue
+    # Fallback watchlist: top N overall if no confirmed tiers
+    watch = []
+    if not tier1 and not tier2:
+        watch = all_scored[:top_n_watch]
 
-            # ------- Score & keep top_k per symbol
-            try:
-                ranked_symbol = score_contracts(enriched)
-            except Exception:
-                # Fallback scorer: normalize ROI and penalize spread
-                ranked_symbol = []
-                max_roi = max(_safe_float(x.get("exp_roi")) for x in enriched) or 1.0
-                for x in enriched:
-                    spread = _safe_float(x.get("ask")) - _safe_float(x.get("bid"))
-                    mid = _safe_float(x.get("mid"), 1.0)
-                    spread_penalty = (spread / mid) if mid > 0 else 1.0
-                    base = _safe_float(x.get("exp_roi")) / max_roi
-                    x["score"] = round(max(0.0, base - 0.2 * spread_penalty), 4)
-                    ranked_symbol.append(x)
+    # Trim debug; but include fetch lines to help diagnose in email
+    logs.extend(per_symbol_debug)
 
-            ranked_symbol.sort(key=lambda r: (_safe_float(r.get("score")), _safe_float(r.get("exp_roi"))), reverse=True)
-            all_rows.extend(ranked_symbol[:top_k])
-
-        except Exception as e_ticker:
-            logs.append(f"[{symbol}] ⚠ Unexpected: {e_ticker}")
-            # Keep traceback in logs for debugging without crashing the whole run
-            tb = traceback.format_exc(limit=1)
-            logs.append(tb.strip())
-            continue
-
-    # -------------------- Global ranking and tiering --------------------------
-    if len(all_rows) == 0:
-        return {"tier1": [], "tier2": [], "watch": [], "all": [], "logs": logs}
-
-    # Global sort: score then ROI
-    all_rows.sort(key=lambda r: (_safe_float(r.get("score")), _safe_float(r.get("exp_roi"))), reverse=True)
-
-    t1, t2, watch = _tier_split(
-        all_rows,
-        tier1_min_score=tier1_min_score,
-        tier2_min_score=tier2_min_score,
-        min_roi=min_roi,
-    )
-
-    # Optionally cap email length
-    cap_tier1 = int(config.get("cap_tier1", 15))
-    cap_tier2 = int(config.get("cap_tier2", 25))
-    cap_watch = int(config.get("cap_watch", 25))
-
-    result = {
-        "tier1": t1[:cap_tier1],
-        "tier2": t2[:cap_tier2],
-        "watch": watch[:cap_watch],
-        "all": all_rows[: (cap_tier1 + cap_tier2 + cap_watch)],
+    return {
+        "tier1": tier1,
+        "tier2": tier2,
+        "watch": watch,
+        "all": all_scored,
         "logs": logs,
     }
-    return result
-
-
-__all__ = ["generate_ranked_ideas"]
